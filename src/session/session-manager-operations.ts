@@ -214,9 +214,22 @@ export class SessionManagerOperations extends SessionManagerData {
         const sessionWithSetup = session as ManagedSession & { _dryRunHandlerSetup?: boolean };
         sessionWithSetup._dryRunHandlerSetup = true;
         
-        // Start the proxy manager
-        await this.startProxyManager(session, scriptPath, scriptArgs, dapLaunchArgs, dryRunSpawn);
-        this.logger.info(`[SessionManager] ProxyManager started for session ${sessionId}`);
+        // Start the proxy manager with timeout
+        this.logger.info(`[SessionManager] Starting ProxyManager for session ${sessionId} with timeout`);
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error('ProxyManager startup timeout after 10 seconds')), 10000);
+        });
+        
+        try {
+          await Promise.race([
+            this.startProxyManager(session, scriptPath, scriptArgs, dapLaunchArgs, dryRunSpawn),
+            timeoutPromise
+          ]);
+          this.logger.info(`[SessionManager] ProxyManager started for session ${sessionId}`);
+        } catch (error) {
+          this.logger.error(`[SessionManager] ProxyManager startup failed or timed out: ${error}`);
+          throw error;
+        }
         
         // Check if already completed before waiting
         const refreshedSession = this._getSessionById(sessionId);
@@ -259,9 +272,22 @@ export class SessionManagerOperations extends SessionManagerData {
       }
       
       // Normal (non-dry-run) flow
-      // Start the proxy manager
-      await this.startProxyManager(session, scriptPath, scriptArgs, dapLaunchArgs, dryRunSpawn);
-      this.logger.info(`[SessionManager] ProxyManager started for session ${sessionId}`);
+      // Start the proxy manager with timeout
+      this.logger.info(`[SessionManager] Starting ProxyManager for session ${sessionId} (non-dry-run) with timeout`);
+      const normalTimeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('ProxyManager startup timeout after 15 seconds')), 15000);
+      });
+      
+      try {
+        await Promise.race([
+          this.startProxyManager(session, scriptPath, scriptArgs, dapLaunchArgs, dryRunSpawn),
+          normalTimeoutPromise
+        ]);
+        this.logger.info(`[SessionManager] ProxyManager started for session ${sessionId}`);
+      } catch (error) {
+        this.logger.error(`[SessionManager] ProxyManager startup failed or timed out: ${error}`);
+        throw error;
+      }
       
       // Wait for adapter to be configured or first stop event
       const waitForReady = new Promise<void>((resolve) => {

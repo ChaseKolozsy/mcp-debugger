@@ -289,6 +289,9 @@ export class PythonDebugAdapter extends EventEmitter implements IDebugAdapter {
   // ===== Adapter Configuration =====
   
   buildAdapterCommand(config: AdapterConfig): AdapterCommand {
+    this.dependencies.logger?.info(`[PythonDebugAdapter] Building adapter command with python: ${config.executablePath}`);
+    this.dependencies.logger?.info(`[PythonDebugAdapter] Adapter will bind to ${config.adapterHost}:${config.adapterPort}`);
+    
     return {
       command: config.executablePath,
       args: [
@@ -299,7 +302,8 @@ export class PythonDebugAdapter extends EventEmitter implements IDebugAdapter {
       env: {
         ...process.env,
         PYTHONUNBUFFERED: '1',  // Ensure unbuffered output
-        DEBUGPY_LOG_DIR: config.logDir
+        DEBUGPY_LOG_DIR: config.logDir,
+        DEBUGPY_LOG_LEVEL: 'debug'  // Enable debugpy debug logging
       }
     };
   }
