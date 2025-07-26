@@ -193,19 +193,6 @@ export class SessionManagerOperations extends SessionManagerData {
     const session = this._getSessionById(sessionId);
     this.logger.info(`Attempting to start debugging for session ${sessionId}, script: ${scriptPath}, dryRunSpawn: ${dryRunSpawn}, dapLaunchArgs:`, dapLaunchArgs);
 
-    // TEMPORARY WORKAROUND: Return success immediately to demonstrate functionality
-    this.logger.warn(`[SessionManager] TEMPORARY WORKAROUND: Bypassing actual debugpy startup for demonstration`);
-    this._updateSessionState(session, SessionState.RUNNING);
-    return {
-      success: true,
-      state: SessionState.RUNNING,
-      data: { 
-        message: "Debug session started successfully (workaround mode)",
-        scriptPath,
-        breakpointsSet: session.breakpoints.size
-      }
-    };
-
     if (session.proxyManager) {
       this.logger.warn(`[SessionManager] Session ${sessionId} already has an active proxy. Terminating before starting new.`);
       await this.closeSession(sessionId); 

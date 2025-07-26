@@ -289,21 +289,32 @@ export class PythonDebugAdapter extends EventEmitter implements IDebugAdapter {
   // ===== Adapter Configuration =====
   
   buildAdapterCommand(config: AdapterConfig): AdapterCommand {
-    this.dependencies.logger?.info(`[PythonDebugAdapter] Building adapter command with python: ${config.executablePath}`);
-    this.dependencies.logger?.info(`[PythonDebugAdapter] Adapter will bind to ${config.adapterHost}:${config.adapterPort}`);
+    this.dependencies.logger?.info(`[PythonDebugAdapter] Building direct debugpy command to run script: ${config.scriptPath}`);
+    this.dependencies.logger?.info(`[PythonDebugAdapter] Python executable: ${config.executablePath}`);
+    this.dependencies.logger?.info(`[PythonDebugAdapter] Will listen on ${config.adapterHost}:${config.adapterPort}`);
     
+    // Make script path absolute to avoid working directory issues
+    const absoluteScriptPath = path.isAbsolute(config.scriptPath) 
+      ? config.scriptPath 
+      : path.resolve(process.cwd(), config.scriptPath);
+    
+    this.dependencies.logger?.info(`[PythonDebugAdapter] Using absolute script path: ${absoluteScriptPath}`);
+    
+    // Use debugpy to run the script directly instead of starting an adapter server
     return {
       command: config.executablePath,
       args: [
-        '-m', 'debugpy.adapter',
-        '--host', config.adapterHost,
-        '--port', config.adapterPort.toString()
+        '-m', 'debugpy',
+        '--listen', `${config.adapterHost}:${config.adapterPort}`,
+        '--wait-for-client',
+        absoluteScriptPath,
+        ...(config.scriptArgs || [])
       ],
       env: {
         ...process.env,
-        PYTHONUNBUFFERED: '1',  // Ensure unbuffered output
+        PYTHONUNBUFFERED: '1',
         DEBUGPY_LOG_DIR: config.logDir,
-        DEBUGPY_LOG_LEVEL: 'debug'  // Enable debugpy debug logging
+        DEBUGPY_LOG_LEVEL: 'debug'
       }
     };
   }
