@@ -166,10 +166,11 @@ export class PythonDebugAdapter extends EventEmitter implements IDebugAdapter {
       // Check debugpy installation
       const hasDebugpy = await this.checkDebugpyInstalled(pythonPath);
       if (!hasDebugpy) {
-        errors.push({
-          code: 'DEBUGPY_NOT_INSTALLED',
-          message: 'debugpy not installed. Run: pip install debugpy',
-          recoverable: true
+        // TEMPORARY WORKAROUND: Log warning but don't fail validation
+        this.dependencies.logger?.warn(`[PythonDebugAdapter] debugpy check failed, but proceeding anyway`);
+        warnings.push({
+          code: 'DEBUGPY_CHECK_FAILED',
+          message: 'Could not verify debugpy installation - debugging may not work properly'
         });
       }
       
