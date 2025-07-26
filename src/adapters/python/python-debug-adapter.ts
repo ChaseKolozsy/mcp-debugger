@@ -293,11 +293,13 @@ export class PythonDebugAdapter extends EventEmitter implements IDebugAdapter {
     this.dependencies.logger?.info(`[PythonDebugAdapter] Python executable: ${config.executablePath}`);
     this.dependencies.logger?.info(`[PythonDebugAdapter] Will listen on ${config.adapterHost}:${config.adapterPort}`);
     
-    // Make script path absolute to avoid working directory issues
+    // Make script path absolute using the workspace directory
+    const workspaceDir = process.env.WORKSPACE_FOLDER_PATHS || process.cwd();
     const absoluteScriptPath = path.isAbsolute(config.scriptPath) 
       ? config.scriptPath 
-      : path.resolve(process.cwd(), config.scriptPath);
+      : path.resolve(workspaceDir, config.scriptPath);
     
+    this.dependencies.logger?.info(`[PythonDebugAdapter] Workspace directory: ${workspaceDir}`);
     this.dependencies.logger?.info(`[PythonDebugAdapter] Using absolute script path: ${absoluteScriptPath}`);
     
     // Use debugpy to run the script directly instead of starting an adapter server
