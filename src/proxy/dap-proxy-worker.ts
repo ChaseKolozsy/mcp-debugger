@@ -265,9 +265,19 @@ export class DapProxyWorker {
       this.logger!.info('[Worker] DIAGNOSTIC: scriptPath length:', payload.scriptPath.length);
       this.logger!.info('[Worker] DIAGNOSTIC: Full payload object:', JSON.stringify(payload, null, 2));
       
+      // Resolve script path to absolute path using workspace directory
+      const workspaceDir = process.env.WORKSPACE_FOLDER_PATHS || process.cwd();
+      const path = await import('path');
+      const absoluteScriptPath = path.isAbsolute(payload.scriptPath) 
+        ? payload.scriptPath 
+        : path.resolve(workspaceDir, payload.scriptPath);
+      
+      this.logger!.info('[Worker] Workspace directory:', workspaceDir);
+      this.logger!.info('[Worker] Resolved absolute script path:', absoluteScriptPath);
+      
       await this.connectionManager!.sendLaunchRequest(
         this.dapClient,
-        payload.scriptPath,
+        absoluteScriptPath,
         payload.scriptArgs,
         payload.stopOnEntry,
         payload.justMyCode

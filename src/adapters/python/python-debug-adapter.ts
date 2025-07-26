@@ -289,34 +289,25 @@ export class PythonDebugAdapter extends EventEmitter implements IDebugAdapter {
   // ===== Adapter Configuration =====
   
   buildAdapterCommand(config: AdapterConfig): AdapterCommand {
-    this.dependencies.logger?.info(`[PythonDebugAdapter] Building direct debugpy command to run script: ${config.scriptPath}`);
+    this.dependencies.logger?.info(`[PythonDebugAdapter] Building debugpy.adapter command`);
     this.dependencies.logger?.info(`[PythonDebugAdapter] Python executable: ${config.executablePath}`);
     this.dependencies.logger?.info(`[PythonDebugAdapter] Will listen on ${config.adapterHost}:${config.adapterPort}`);
     
-    // Make script path absolute using the workspace directory
-    const workspaceDir = process.env.WORKSPACE_FOLDER_PATHS || process.cwd();
-    const absoluteScriptPath = path.isAbsolute(config.scriptPath) 
-      ? config.scriptPath 
-      : path.resolve(workspaceDir, config.scriptPath);
-    
-    this.dependencies.logger?.info(`[PythonDebugAdapter] Workspace directory: ${workspaceDir}`);
-    this.dependencies.logger?.info(`[PythonDebugAdapter] Using absolute script path: ${absoluteScriptPath}`);
-    
-    // Use debugpy to run the script directly instead of starting an adapter server
+    // Start debugpy adapter server (NOT the script directly)
     return {
       command: config.executablePath,
       args: [
-        '-m', 'debugpy',
-        '--listen', `${config.adapterHost}:${config.adapterPort}`,
-        '--wait-for-client',
-        absoluteScriptPath,
-        ...(config.scriptArgs || [])
+        '-m', 'debugpy.adapter',
+        '--host', config.adapterHost,
+        '--port', config.adapterPort.toString()
       ],
       env: {
         ...process.env,
         PYTHONUNBUFFERED: '1',
         DEBUGPY_LOG_DIR: config.logDir,
-        DEBUGPY_LOG_LEVEL: 'debug'
+        DEBUGPY_LOG_LEVEL: 'debug',
+        // Make workspace directory available for script path resolution
+        WORKSPACE_FOLDER_PATHS: process.env.WORKSPACE_FOLDER_PATHS || process.cwd()
       }
     };
   }
