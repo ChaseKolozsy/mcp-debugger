@@ -1,68 +1,61 @@
 /**
- * Manager for line-by-line code validation
+ * ValidationManager - Manages line-by-line code validation sessions
  */
-import { v4 as uuidv4 } from 'uuid';
+import { EventEmitter } from 'events';
 import * as path from 'path';
-import { promises as fs } from 'fs';
-import { Logger } from 'winston';
-import { SessionManager } from '../session/session-manager.js';
-import { ClearedLinesStore } from './cleared-lines-store.js';
+import { spawn } from 'child_process';
 import { 
-  ValidationConfig, 
-  ValidationSession, 
-  ValidationResult, 
+  ValidationSession,
+  ValidationConfig,
+  ValidationResult,
   ValidationError,
-  LineInfo 
+  LineInfo
 } from './models.js';
-import { execSync } from 'child_process';
+import { ClearedLinesStore } from './cleared-lines-store.js';
+import { SessionManager } from '../session/session-manager.js';
 import { ExecutionState } from '../session/models.js';
+import { v4 as uuidv4 } from 'uuid';
 
-export interface ValidationManagerDependencies {
-  logger: Logger;
-  sessionManager: SessionManager;
-}
+export class ValidationManager extends EventEmitter {
+  private sessions = new Map<string, ValidationSession>();
+  private clearedStores = new Map<string, ClearedLinesStore>();
 
-/**
- * Manages line-by-line code validation sessions
- */
-export class ValidationManager {
-  private readonly logger: Logger;
-  private readonly sessionManager: SessionManager;
-  private readonly sessions: Map<string, ValidationSession> = new Map();
-  private readonly clearedStores: Map<string, ClearedLinesStore> = new Map();
-
-  constructor(dependencies: ValidationManagerDependencies) {
-    this.logger = dependencies.logger;
-    this.sessionManager = dependencies.sessionManager;
+  constructor(
+    private sessionManager: SessionManager,
+    private logger: any,
+    private fileSystem: any
+  ) {
+    super();
   }
 
   /**
    * Create a new validation session
    */
-  async createSession(config: ValidationConfig): Promise<ValidationSession> {
+  async createValidationSession(config: ValidationConfig): Promise<string> {
+    const sessionId = uuidv4();
+    
     const session: ValidationSession = {
-      id: uuidv4(),
+      id: sessionId,
       config,
+      state: 'running',
       debugSessionId: config.sessionId,
-      startedAt: new Date(),
-      filesProcessed: new Set(),
       totalLinesValidated: 0,
       errorsFound: [],
-      state: 'paused'
+      currentFile: config.startFile,
+      currentLine: config.startLine || 1,
+      filesProcessed: new Set(),
+      startedAt: new Date()
     };
 
-    this.sessions.set(session.id, session);
+    this.sessions.set(sessionId, session);
 
-    // Initialize cleared lines store
-    const storePath = config.persistencePath || 
-      path.join(process.cwd(), '.mcp-debugger', 'cleared-lines.json');
-    
-    const store = new ClearedLinesStore(storePath, { logger: this.logger });
+    // Create cleared lines store
+    const store = new ClearedLinesStore(config.persistencePath || './validation-data', this.logger);
     await store.initialize();
-    this.clearedStores.set(session.id, store);
+    this.clearedStores.set(sessionId, store);
 
-    this.logger.info(`[ValidationManager] Created validation session ${session.id}`);
-    return session;
+    this.logger.info(`[ValidationManager] Created validation session ${sessionId}`);
+    return sessionId;
   }
 
   /**
@@ -79,16 +72,40 @@ export class ValidationManager {
       throw new Error(`Cleared lines store for session ${sessionId} not found`);
     }
 
+    // Check debug session exists
+    const debugSession = this.sessionManager.getSession(session.debugSessionId);
+    if (!debugSession) {
+      throw new Error(`Debug session ${session.debugSessionId} not found`);
+    }
+
     session.state = 'running';
-    
+    session.startedAt = new Date();
+
     try {
-      // Start from the configured file and line
-      const startFile = session.config.startFile;
-      const startLine = session.config.startLine || 1;
-      
-      await this.validateFile(session, store, startFile, startLine);
-      
+      // First start the debugging session with the script
+      const debugResult = await this.sessionManager.startDebugging(
+        session.debugSessionId,
+        session.config.startFile,
+        [], // No args for now
+        { 
+          stopOnEntry: true, 
+          justMyCode: !session.config.followCalls 
+        },
+        false // Not a dry run
+      );
+
+      if (!debugResult.success) {
+        throw new Error(`Failed to start debugging: ${debugResult.error}`);
+      }
+
+      // Wait for initial stop
+      await this.waitForStopped(session.debugSessionId, 10000);
+
+      // Start validation
+      await this.validateExecution(session, store);
+
       session.state = 'completed';
+
       return {
         success: true,
         session,
@@ -96,8 +113,10 @@ export class ValidationManager {
       };
     } catch (error) {
       session.state = 'error';
-      const errorMessage = error instanceof Error ? error.message : String(error);
       
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.logger.error(`[ValidationManager] Validation error: ${errorMessage}`, error);
+
       return {
         success: false,
         session,
@@ -108,177 +127,181 @@ export class ValidationManager {
   }
 
   /**
-   * Validate a file starting from a specific line
+   * Main validation loop - follows execution flow
    */
-  private async validateFile(
-    session: ValidationSession, 
-    store: ClearedLinesStore, 
-    filePath: string, 
-    startLine: number
+  private async validateExecution(
+    session: ValidationSession,
+    store: ClearedLinesStore
   ): Promise<void> {
-    const normalized = path.resolve(filePath);
-    
-    if (session.filesProcessed.has(normalized)) {
-      this.logger.debug(`[ValidationManager] File ${normalized} already processed, skipping`);
-      return;
-    }
+    const processedLines = new Set<string>(); // Track file:line combinations
 
-    session.filesProcessed.add(normalized);
-    session.currentFile = normalized;
-
-    // Read file content
-    const content = await fs.readFile(normalized, 'utf-8');
-    const lines = content.split('\n');
-
-    // Get cleared lines if skipCleared is enabled
-    let clearedLines: Set<number> = new Set();
-    if (session.config.skipCleared) {
-      const cleared = await store.getClearedLines(normalized);
-      clearedLines = new Set(cleared);
-    }
-
-    // Process each line
-    for (let lineNum = startLine; lineNum <= lines.length; lineNum++) {
-      if (session.state !== 'running') {
-        this.logger.info(`[ValidationManager] Session ${session.id} stopped at line ${lineNum}`);
-        break;
-      }
-
-      session.currentLine = lineNum;
-
-      // Skip if already cleared
-      if (clearedLines.has(lineNum)) {
-        this.logger.debug(`[ValidationManager] Skipping cleared line ${normalized}:${lineNum}`);
-        continue;
-      }
-
-      const lineContent = lines[lineNum - 1];
-      const lineInfo = this.analyzeLineWaiting(normalized, lineNum, lineContent);
-
-      // Skip non-executable lines
-      if (!this.isExecutableLine(lineInfo)) {
-        this.logger.debug(`[ValidationManager] Skipping non-executable line ${normalized}:${lineNum}`);
-        continue;
-      }
-
-      // In pair mode, speak the line
-      if (session.config.mode === 'pair' && session.config.voiceEnabled) {
-        await this.speakLine(normalized, lineNum, lineContent, session.config.voiceRate);
-      }
-
-      // Set breakpoint and step
+    while (session.state === 'running') {
       try {
-        await this.validateLine(session, store, normalized, lineNum, lineInfo);
-        
+        // Get current execution position
+        const stackTrace = await this.sessionManager.getStackTrace(session.debugSessionId);
+        if (!stackTrace || stackTrace.length === 0) {
+          this.logger.warn('[ValidationManager] No stack trace available, ending validation');
+          break;
+        }
+
+        const currentFrame = stackTrace[0];
+        if (!currentFrame || !currentFrame.file || !currentFrame.line) {
+          this.logger.warn('[ValidationManager] Invalid stack frame, ending validation');
+          break;
+        }
+
+        const currentFile = path.resolve(currentFrame.file);
+        const currentLine = currentFrame.line;
+        const lineKey = `${currentFile}:${currentLine}`;
+
+        // Update session position
+        session.currentFile = currentFile;
+        session.currentLine = currentLine;
+
+        // Check if we've already processed this exact line in this session
+        if (processedLines.has(lineKey)) {
+          this.logger.debug(`[ValidationManager] Already processed ${lineKey} in this session, stepping over`);
+          await this.stepAndWait(session);
+          continue;
+        }
+
+        processedLines.add(lineKey);
+
+        // Check if line is already cleared from previous runs
+        if (session.config.skipCleared && await store.isLineCleared(currentFile, currentLine)) {
+          this.logger.debug(`[ValidationManager] Line ${lineKey} already cleared, stepping over`);
+          await this.stepAndWait(session);
+          continue;
+        }
+
+        // Read the line content
+        let lineContent = '';
+        try {
+          const fileContent = await this.fileSystem.readFile(currentFile, 'utf-8');
+          const lines = fileContent.split('\n');
+          lineContent = lines[currentLine - 1] || '';
+        } catch (error) {
+          this.logger.warn(`[ValidationManager] Could not read file ${currentFile}: ${error}`);
+        }
+
+        // Analyze the line
+        const lineInfo = this.analyzeLine(currentFile, currentLine, lineContent);
+
+        // In pair mode, speak the line
+        if (session.config.mode === 'pair' && session.config.voiceEnabled) {
+          await this.speakLine(lineInfo, session.config.voiceRate);
+        }
+
+        // Check if we should step into or over
+        let shouldStepInto = false;
+        if (session.config.followCalls && this.looksLikeFunctionCall(lineContent)) {
+          shouldStepInto = true;
+        }
+
+        // Perform the step
+        if (shouldStepInto) {
+          await this.stepIntoAndWait(session);
+        } else {
+          await this.stepAndWait(session);
+        }
+
         // Mark line as cleared
-        await store.markLineCleared(normalized, lineNum);
+        await store.markLineCleared(currentFile, currentLine);
         session.totalLinesValidated++;
-        
+
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
+        
+        // Check if it's a normal termination
+        if (errorMessage.includes('exited') || errorMessage.includes('terminated')) {
+          this.logger.info('[ValidationManager] Program terminated normally');
+          break;
+        }
+
+        // Record the error
         const validationError: ValidationError = {
-          file: normalized,
-          line: lineNum,
+          file: session.currentFile || '',
+          line: session.currentLine || 0,
           error: errorMessage,
-          stack: error instanceof Error ? error.stack : undefined,
           occurredAt: new Date()
         };
         
         session.errorsFound.push(validationError);
-        await store.recordError(normalized, lineNum, errorMessage, validationError.stack);
-        
+        this.logger.error(`[ValidationManager] Error at ${session.currentFile}:${session.currentLine}: ${errorMessage}`);
+
         // In pair mode, speak the error
         if (session.config.mode === 'pair' && session.config.voiceEnabled) {
-          await this.speakError(normalized, lineNum, errorMessage);
+          await this.speakError(errorMessage, session.config.voiceRate);
         }
-        
-        // Continue or stop based on configuration
-        if (session.config.mode === 'pair') {
-          // In pair mode, pause for user intervention
-          session.state = 'paused';
-          throw new Error(`Error at ${normalized}:${lineNum}: ${errorMessage}`);
+
+        // Try to continue
+        try {
+          await this.stepAndWait(session);
+        } catch (stepError) {
+          this.logger.error('[ValidationManager] Cannot continue after error, ending validation');
+          break;
         }
       }
     }
   }
 
   /**
-   * Validate a single line
+   * Step over and wait for stopped event
    */
-  private async validateLine(
-    session: ValidationSession,
-    store: ClearedLinesStore,
-    filePath: string,
-    lineNum: number,
-    lineInfo: LineInfo
-  ): Promise<void> {
-    const debugSession = this.sessionManager.getSession(session.debugSessionId);
-    if (!debugSession) {
-      throw new Error(`Debug session ${session.debugSessionId} not found`);
+  private async stepAndWait(session: ValidationSession): Promise<void> {
+    const result = await this.sessionManager.stepOver(session.debugSessionId);
+    if (!result.success) {
+      throw new Error(`Step failed: ${result.error}`);
     }
-    
-    // Set breakpoint on this line
-    const breakpoint = await this.sessionManager.setBreakpoint(
-      session.debugSessionId, 
-      filePath, 
-      lineNum
-    );
-
-    // If not already paused, continue to hit the breakpoint
-    if (debugSession.executionState !== ExecutionState.PAUSED) {
-      await this.sessionManager.continue(session.debugSessionId);
-      
-      // Wait for stopped event
-      await this.waitForStopped(session.debugSessionId, 5000);
-    }
-
-    // Now step over this line
-    await this.sessionManager.stepOver(session.debugSessionId);
-    
-    // Wait for the step to complete
     await this.waitForStopped(session.debugSessionId, 5000);
-
-    // If this line has function calls and followCalls is enabled, analyze the stack
-    if (session.config.followCalls && lineInfo.functionCalls && lineInfo.functionCalls.length > 0) {
-      await this.handleFunctionCalls(session, store, lineInfo);
-    }
-
-    // Remove the breakpoint by setting a new breakpoint list without this one
-    // (since there's no removeBreakpoint method, we'll just leave it for now)
   }
 
   /**
-   * Handle function calls by stepping into them
+   * Step into and wait for stopped event
    */
-  private async handleFunctionCalls(
-    session: ValidationSession,
-    store: ClearedLinesStore,
-    _lineInfo: LineInfo
-  ): Promise<void> {
-    // Get current stack trace
-    const stackFrames = await this.sessionManager.getStackTrace(session.debugSessionId);
-    
-    if (stackFrames.length > 1) {
-      // We're inside a function call
-      const calledFrame = stackFrames[0];
-      
-      if (calledFrame.file && calledFrame.line) {
-        this.logger.info(`[ValidationManager] Stepping into function at ${calledFrame.file}:${calledFrame.line}`);
-        
-        // Recursively validate the called function
-        await this.validateFile(session, store, calledFrame.file, calledFrame.line);
-        
-        // Step out to return to caller
-        await this.sessionManager.stepOut(session.debugSessionId);
-        await this.waitForStopped(session.debugSessionId, 5000);
+  private async stepIntoAndWait(session: ValidationSession): Promise<void> {
+    const result = await this.sessionManager.stepInto(session.debugSessionId);
+    if (!result.success) {
+      throw new Error(`Step into failed: ${result.error}`);
+    }
+    await this.waitForStopped(session.debugSessionId, 5000);
+  }
+
+  /**
+   * Wait for debugger to stop
+   */
+  private async waitForStopped(sessionId: string, timeoutMs: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(`Timeout waiting for debugger to stop`));
+      }, timeoutMs);
+
+      // Check if already paused
+      const session = this.sessionManager.getSession(sessionId);
+      if (session?.executionState === ExecutionState.PAUSED) {
+        clearTimeout(timeout);
+        resolve();
+        return;
       }
-    }
+
+      // Wait for stopped event
+      if (!session || !session.proxyManager) {
+        clearTimeout(timeout);
+        reject(new Error('No proxy manager or session not found'));
+        return;
+      }
+
+      session.proxyManager.once('stopped', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
   }
 
   /**
-   * Analyze a line to determine its type and extract information
+   * Analyze a line to determine its type
    */
-  private analyzeLineWaiting(filePath: string, lineNum: number, content: string): LineInfo {
+  private analyzeLine(filePath: string, lineNum: number, content: string): LineInfo {
     const trimmed = content.trim();
     const info: LineInfo = {
       file: filePath,
@@ -296,9 +319,9 @@ export class ValidationManager {
     else if (trimmed.startsWith('def ')) {
       info.type = 'function_def';
     }
-    // Detect method definitions (indented def)
-    else if (/^\s+def /.test(content)) {
-      info.type = 'method_def';
+    // Detect class definitions (mapped to function_def for now)
+    else if (trimmed.startsWith('class ')) {
+      info.type = 'function_def';
     }
     // Detect return statements
     else if (trimmed.startsWith('return')) {
@@ -312,7 +335,7 @@ export class ValidationManager {
     else if (trimmed.includes('=') && !trimmed.includes('==')) {
       info.type = 'assignment';
     }
-    // Detect function calls (simple heuristic)
+    // Detect function calls
     else if (/\w+\s*\(/.test(trimmed)) {
       info.type = 'function_call';
       info.functionCalls = this.extractFunctionCalls(trimmed);
@@ -322,7 +345,21 @@ export class ValidationManager {
   }
 
   /**
-   * Extract function names from a line with function calls
+   * Check if a line looks like it contains a function call
+   */
+  private looksLikeFunctionCall(line: string): boolean {
+    const trimmed = line.trim();
+    // Simple heuristic - contains parentheses and not a definition
+    return /\w+\s*\(/.test(trimmed) && 
+           !trimmed.startsWith('def ') && 
+           !trimmed.startsWith('class ') &&
+           !trimmed.startsWith('if ') &&
+           !trimmed.startsWith('while ') &&
+           !trimmed.startsWith('for ');
+  }
+
+  /**
+   * Extract function names from a line
    */
   private extractFunctionCalls(line: string): string[] {
     const calls: string[] = [];
@@ -330,7 +367,11 @@ export class ValidationManager {
     let match;
     
     while ((match = regex.exec(line)) !== null) {
-      calls.push(match[1]);
+      // Skip Python keywords
+      const keywords = ['if', 'while', 'for', 'def', 'class', 'with', 'except'];
+      if (!keywords.includes(match[1])) {
+        calls.push(match[1]);
+      }
     }
     
     return calls;
@@ -356,80 +397,49 @@ export class ValidationManager {
   }
 
   /**
-   * Check if a line is executable
+   * Speak a line using macOS say
    */
-  private isExecutableLine(lineInfo: LineInfo): boolean {
-    const nonExecutableTypes = ['import', 'function_def', 'method_def'];
-    if (nonExecutableTypes.includes(lineInfo.type)) {
-      return false;
-    }
-    
-    const trimmed = lineInfo.content.trim();
-    if (!trimmed || trimmed.startsWith('#') || trimmed === 'pass') {
-      return false;
-    }
-    
-    return true;
+  private async speakLine(lineInfo: LineInfo, rate?: number): Promise<void> {
+    const text = `Line ${lineInfo.line}: ${lineInfo.content.trim()}`;
+    await this.speak(text, rate);
   }
 
   /**
-   * Wait for debugger to stop
+   * Speak an error
    */
-  private async waitForStopped(sessionId: string, timeoutMs: number): Promise<void> {
+  private async speakError(error: string, rate?: number): Promise<void> {
+    const text = `Error: ${error}`;
+    await this.speak(text, rate);
+  }
+
+  /**
+   * Speak text using macOS say command
+   */
+  private async speak(text: string, rate: number = 200): Promise<void> {
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error(`Timeout waiting for debugger to stop`));
-      }, timeoutMs);
-
-      const session = this.sessionManager.getSession(sessionId);
-      if (!session || !session.proxyManager) {
-        clearTimeout(timeout);
-        reject(new Error('No proxy manager or session not found'));
-        return;
-      }
-
-      session.proxyManager.once('stopped', () => {
-        clearTimeout(timeout);
-        resolve();
+      const proc = spawn('say', ['-r', String(rate), text]);
+      
+      proc.on('error', (err) => {
+        this.logger.error('[ValidationManager] Failed to speak:', err);
+        reject(err);
+      });
+      
+      proc.on('exit', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`say command exited with code ${code}`));
+        }
       });
     });
   }
 
   /**
-   * Speak a line using macOS say
-   */
-  private async speakLine(file: string, line: number, content: string, rate?: number): Promise<void> {
-    const basename = path.basename(file);
-    const text = `Line ${line} in ${basename}: ${content.trim()}`;
-    const rateArg = rate ? `-r ${rate}` : '';
-    
-    try {
-      execSync(`say ${rateArg} "${text.replace(/"/g, '\\"')}"`);
-    } catch (error) {
-      this.logger.error('[ValidationManager] Failed to speak line:', error);
-    }
-  }
-
-  /**
-   * Speak an error using macOS say
-   */
-  private async speakError(file: string, line: number, error: string): Promise<void> {
-    const basename = path.basename(file);
-    const text = `Error at line ${line} in ${basename}: ${error}`;
-    
-    try {
-      execSync(`say "${text.replace(/"/g, '\\"')}"`);
-    } catch (error) {
-      this.logger.error('[ValidationManager] Failed to speak error:', error);
-    }
-  }
-
-  /**
    * Pause validation
    */
-  async pauseValidation(sessionId: string): Promise<void> {
+  pauseValidation(sessionId: string): void {
     const session = this.sessions.get(sessionId);
-    if (session) {
+    if (session && session.state === 'running') {
       session.state = 'paused';
       this.logger.info(`[ValidationManager] Paused validation session ${sessionId}`);
     }
@@ -439,19 +449,27 @@ export class ValidationManager {
    * Get validation statistics
    */
   async getStatistics(sessionId: string): Promise<any> {
+    const session = this.sessions.get(sessionId);
     const store = this.clearedStores.get(sessionId);
-    if (!store) {
-      throw new Error(`No store found for session ${sessionId}`);
-    }
     
-    return await store.getStatistics();
-  }
+    if (!session || !store) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
 
-  /**
-   * Get session info
-   */
-  getSession(sessionId: string): ValidationSession | undefined {
-    return this.sessions.get(sessionId);
+    const stats = await store.getStatistics();
+    
+    return {
+      session: {
+        id: session.id,
+        state: session.state,
+        totalLinesValidated: session.totalLinesValidated,
+        errorsFound: session.errorsFound.length,
+        currentFile: session.currentFile,
+        currentLine: session.currentLine,
+        startedAt: session.startedAt
+      },
+      store: stats
+    };
   }
 
   /**
@@ -464,17 +482,23 @@ export class ValidationManager {
   /**
    * Close a validation session
    */
-  async closeSession(sessionId: string): Promise<void> {
+  async closeValidationSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (session) {
-      const store = this.clearedStores.get(sessionId);
-      if (store) {
-        await store.persist();
-        this.clearedStores.delete(sessionId);
-      }
-      
-      this.sessions.delete(sessionId);
-      this.logger.info(`[ValidationManager] Closed validation session ${sessionId}`);
+      session.state = 'completed';
     }
+
+    const store = this.clearedStores.get(sessionId);
+    if (store) {
+      // Store doesn't have a close method, just remove it
+      this.clearedStores.delete(sessionId);
+    }
+
+    this.sessions.delete(sessionId);
+    this.logger.info(`[ValidationManager] Closed validation session ${sessionId}`);
   }
+
+  // Aliases for backward compatibility
+  createSession = this.createValidationSession;
+  closeSession = this.closeValidationSession;
 }

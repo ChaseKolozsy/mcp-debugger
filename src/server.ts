@@ -291,10 +291,11 @@ export class DebugMcpServer {
     
     this.sessionManager = new SessionManager(sessionManagerConfig, dependencies);
     
-    this.validationManager = new ValidationManager({
-      logger: this.logger,
-      sessionManager: this.sessionManager
-    });
+    this.validationManager = new ValidationManager(
+      this.sessionManager,
+      this.logger,
+      dependencies.fileSystem
+    );
 
     this.registerTools();
     this.server.onerror = (error) => {
@@ -721,13 +722,13 @@ export class DebugMcpServer {
                 voiceRate: args.voiceRate,
                 persistencePath: args.persistencePath
               };
-              const validationSession = await this.validationManager.createSession(config);
+              const validationSessionId = await this.validationManager.createSession(config);
               result = { 
                 content: [{ 
                   type: 'text', 
                   text: JSON.stringify({ 
                     success: true, 
-                    validationSessionId: validationSession.id,
+                    validationSessionId: validationSessionId,
                     message: `Created ${config.mode} mode validation session for ${path.basename(config.startFile)}`
                   }) 
                 }] 
