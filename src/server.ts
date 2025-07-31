@@ -24,6 +24,8 @@ import {
 } from './session/models.js';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import path from 'path';
+import { ValidationManager } from './validation/validation-manager.js';
+import { ValidationConfig } from './validation/models.js';
 /**
  * Configuration options for the Debug MCP Server
  */
@@ -62,6 +64,17 @@ interface ToolArguments {
   frameId?: number;
   expression?: string;
   linesContext?: number;
+  // Validation tool arguments
+  validationSessionId?: string;
+  mode?: 'pair' | 'auto';
+  startFile?: string;
+  startLine?: number;
+  followImports?: boolean;
+  followCalls?: boolean;
+  skipCleared?: boolean;
+  voiceEnabled?: boolean;
+  voiceRate?: number;
+  persistencePath?: string;
 }
 
 /**
@@ -70,7 +83,8 @@ interface ToolArguments {
 export class DebugMcpServer {
   public server: Server;
   private sessionManager: SessionManager;
-  private logger;
+  private validationManager: ValidationManager;
+  private logger: any; // Using any to match the existing pattern in the codebase
   private constructorOptions: DebugMcpServerOptions;
   private supportedLanguages: string[] = [];
 
@@ -276,6 +290,11 @@ export class DebugMcpServer {
     };
     
     this.sessionManager = new SessionManager(sessionManagerConfig, dependencies);
+    
+    this.validationManager = new ValidationManager({
+      logger: this.logger,
+      sessionManager: this.sessionManager
+    });
 
     this.registerTools();
     this.server.onerror = (error) => {
@@ -374,6 +393,28 @@ export class DebugMcpServer {
           { name: 'get_scopes', description: 'Get scopes for a stack frame', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, frameId: { type: 'number', description: "The ID of the stack frame from a stackTrace response" } }, required: ['sessionId', 'frameId'] } },
           { name: 'evaluate_expression', description: 'Evaluate expression (Not Implemented)', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, expression: { type: 'string' } }, required: ['sessionId', 'expression'] } },
           { name: 'get_source_context', description: 'Get source context (Not Implemented)', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, file: { type: 'string', description: fileDescription }, line: { type: 'number' }, linesContext: { type: 'number' } }, required: ['sessionId', 'file', 'line'] } },
+          // Validation tools
+          { name: 'create_validation_session', description: 'Create a line-by-line code validation session', inputSchema: { 
+            type: 'object', 
+            properties: { 
+              sessionId: { type: 'string', description: 'Debug session ID to use for validation' },
+              mode: { type: 'string', enum: ['pair', 'auto'], description: 'Validation mode: pair (interactive with voice) or auto (silent)' },
+              startFile: { type: 'string', description: 'File to start validation from' },
+              startLine: { type: 'number', description: 'Line number to start from (default: 1)' },
+              followImports: { type: 'boolean', description: 'Follow and validate imported modules' },
+              followCalls: { type: 'boolean', description: 'Step into function/method calls' },
+              skipCleared: { type: 'boolean', description: 'Skip previously cleared lines' },
+              voiceEnabled: { type: 'boolean', description: 'Enable voice output in pair mode' },
+              voiceRate: { type: 'number', description: 'Speech rate (words per minute)' },
+              persistencePath: { type: 'string', description: 'Path to store cleared lines data' }
+            }, 
+            required: ['sessionId', 'mode', 'startFile'] 
+          }},
+          { name: 'start_validation', description: 'Start or resume a validation session', inputSchema: { type: 'object', properties: { validationSessionId: { type: 'string' } }, required: ['validationSessionId'] } },
+          { name: 'pause_validation', description: 'Pause a running validation session', inputSchema: { type: 'object', properties: { validationSessionId: { type: 'string' } }, required: ['validationSessionId'] } },
+          { name: 'get_validation_statistics', description: 'Get statistics about validation progress', inputSchema: { type: 'object', properties: { validationSessionId: { type: 'string' } }, required: ['validationSessionId'] } },
+          { name: 'list_validation_sessions', description: 'List all validation sessions', inputSchema: { type: 'object', properties: {} } },
+          { name: 'close_validation_session', description: 'Close a validation session', inputSchema: { type: 'object', properties: { validationSessionId: { type: 'string' } }, required: ['validationSessionId'] } },
         ],
       };
     });
@@ -664,6 +705,112 @@ export class DebugMcpServer {
             }
             case 'list_supported_languages': {
               result = await this.handleListSupportedLanguages();
+              break;
+            }
+            // Validation tools
+            case 'create_validation_session': {
+              const config: ValidationConfig = {
+                sessionId: args.sessionId!,
+                mode: args.mode as 'pair' | 'auto',
+                startFile: args.startFile!,
+                startLine: args.startLine,
+                followImports: args.followImports || false,
+                followCalls: args.followCalls || true,
+                skipCleared: args.skipCleared || true,
+                voiceEnabled: args.voiceEnabled !== false,
+                voiceRate: args.voiceRate,
+                persistencePath: args.persistencePath
+              };
+              const validationSession = await this.validationManager.createSession(config);
+              result = { 
+                content: [{ 
+                  type: 'text', 
+                  text: JSON.stringify({ 
+                    success: true, 
+                    validationSessionId: validationSession.id,
+                    message: `Created ${config.mode} mode validation session for ${path.basename(config.startFile)}`
+                  }) 
+                }] 
+              };
+              break;
+            }
+            case 'start_validation': {
+              if (!args.validationSessionId) {
+                throw new McpError(McpErrorCode.InvalidParams, 'Missing required validationSessionId');
+              }
+              const validationResult = await this.validationManager.startValidation(args.validationSessionId);
+              result = { 
+                content: [{ 
+                  type: 'text', 
+                  text: JSON.stringify({
+                    success: validationResult.success,
+                    message: validationResult.message,
+                    totalLinesValidated: validationResult.session.totalLinesValidated,
+                    errorsFound: validationResult.errors?.length || 0
+                  }) 
+                }] 
+              };
+              break;
+            }
+            case 'pause_validation': {
+              if (!args.validationSessionId) {
+                throw new McpError(McpErrorCode.InvalidParams, 'Missing required validationSessionId');
+              }
+              await this.validationManager.pauseValidation(args.validationSessionId);
+              result = { 
+                content: [{ 
+                  type: 'text', 
+                  text: JSON.stringify({ success: true, message: 'Validation paused' }) 
+                }] 
+              };
+              break;
+            }
+            case 'get_validation_statistics': {
+              if (!args.validationSessionId) {
+                throw new McpError(McpErrorCode.InvalidParams, 'Missing required validationSessionId');
+              }
+              const stats = await this.validationManager.getStatistics(args.validationSessionId);
+              result = { 
+                content: [{ 
+                  type: 'text', 
+                  text: JSON.stringify({ success: true, statistics: stats }) 
+                }] 
+              };
+              break;
+            }
+            case 'list_validation_sessions': {
+              const sessions = this.validationManager.listSessions();
+              result = { 
+                content: [{ 
+                  type: 'text', 
+                  text: JSON.stringify({ 
+                    success: true, 
+                    sessions: sessions.map(s => ({
+                      id: s.id,
+                      mode: s.config.mode,
+                      state: s.state,
+                      startFile: s.config.startFile,
+                      currentFile: s.currentFile,
+                      currentLine: s.currentLine,
+                      totalLinesValidated: s.totalLinesValidated,
+                      errorsFound: s.errorsFound.length
+                    }))
+                  }) 
+                }] 
+              };
+              break;
+            }
+            case 'close_validation_session': {
+              if (!args.validationSessionId) {
+                throw new McpError(McpErrorCode.InvalidParams, 'Missing required validationSessionId');
+              }
+              await this.validationManager.closeSession(args.validationSessionId);
+              result = { 
+                content: [{ 
+                  type: 'text', 
+                  text: JSON.stringify({ success: true, message: 'Validation session closed' }) 
+                }] 
+              };
               break;
             }
             default:
