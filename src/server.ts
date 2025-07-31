@@ -710,10 +710,14 @@ export class DebugMcpServer {
             }
             // Validation tools
             case 'create_validation_session': {
+              if (!args.sessionId || !args.mode || !args.startFile) {
+                throw new McpError(McpErrorCode.InvalidParams, 'Missing required parameters: sessionId, mode, startFile');
+              }
+              
               const config: ValidationConfig = {
-                sessionId: args.sessionId!,
+                sessionId: args.sessionId,
                 mode: args.mode as 'pair' | 'auto',
-                startFile: args.startFile!,
+                startFile: args.startFile,
                 startLine: args.startLine,
                 followImports: args.followImports || false,
                 followCalls: args.followCalls || true,
@@ -722,6 +726,9 @@ export class DebugMcpServer {
                 voiceRate: args.voiceRate,
                 persistencePath: args.persistencePath
               };
+              
+              this.logger.info('[Server] Creating validation session with config:', config);
+              
               const validationSessionId = await this.validationManager.createSession(config);
               result = { 
                 content: [{ 
@@ -745,9 +752,9 @@ export class DebugMcpServer {
                   type: 'text', 
                   text: JSON.stringify({
                     success: validationResult.success,
-                    message: validationResult.message,
-                    totalLinesValidated: validationResult.session.totalLinesValidated,
-                    errorsFound: validationResult.errors?.length || 0
+                    message: validationResult.message || '',
+                    totalLinesValidated: validationResult.session?.totalLinesValidated || 0,
+                    errorsFound: validationResult.errors?.length || validationResult.session?.errorsFound?.length || 0
                   }) 
                 }] 
               };

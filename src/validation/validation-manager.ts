@@ -50,7 +50,10 @@ export class ValidationManager extends EventEmitter {
     this.sessions.set(sessionId, session);
 
     // Create cleared lines store
-    const store = new ClearedLinesStore(config.persistencePath || './validation-data', this.logger);
+    const store = new ClearedLinesStore(
+      config.persistencePath || './validation-data', 
+      { logger: this.logger }
+    );
     await store.initialize();
     this.clearedStores.set(sessionId, store);
 
@@ -82,26 +85,18 @@ export class ValidationManager extends EventEmitter {
     session.startedAt = new Date();
 
     try {
-      // First start the debugging session with the script
-      const debugResult = await this.sessionManager.startDebugging(
-        session.debugSessionId,
-        session.config.startFile,
-        [], // No args for now
-        { 
-          stopOnEntry: true, 
-          justMyCode: !session.config.followCalls 
-        },
-        false // Not a dry run
-      );
-
-      if (!debugResult.success) {
-        throw new Error(`Failed to start debugging: ${debugResult.error}`);
+      // Check if debugging is already started
+      const executionState = debugSession.executionState;
+      
+      this.logger.info(`[ValidationManager] Debug session state: ${debugSession.state}, execution: ${executionState}`);
+      
+      // If not paused, we need to wait for it
+      if (executionState !== ExecutionState.PAUSED) {
+        this.logger.info('[ValidationManager] Waiting for debug session to pause...');
+        await this.waitForStopped(session.debugSessionId, 10000);
       }
 
-      // Wait for initial stop
-      await this.waitForStopped(session.debugSessionId, 10000);
-
-      // Start validation
+      // Start validation from current position
       await this.validateExecution(session, store);
 
       session.state = 'completed';
