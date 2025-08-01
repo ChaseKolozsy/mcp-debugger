@@ -163,7 +163,7 @@ export class DebugMcpServer {
         const voiceConfig: VoiceOutputConfig = {
           enabled: true,
           voice: params.voiceConfig?.voice,
-          rate: params.voiceConfig?.rate
+          rate: params.voiceConfig?.rate || 250  // Default to 250 wpm
         };
         const voiceOutput = new VoiceOutput(voiceConfig, this.logger);
         this.voiceOutputs.set(sessionInfo.id, voiceOutput);
