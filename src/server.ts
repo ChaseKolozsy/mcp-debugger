@@ -831,12 +831,12 @@ export class DebugMcpServer {
                   }
                   
                   if (spokenText) {
-                    // Use async speak to not block the response
-                    voiceOutput.speakAsync(spokenText);
+                    // Wait for voice output to complete before returning
+                    await voiceOutput.speak(spokenText);
                   }
                 } catch (parseError) {
                   // If not JSON, speak the raw text
-                  voiceOutput.speakAsync(textContent.text);
+                  await voiceOutput.speak(textContent.text);
                 }
               }
             }
