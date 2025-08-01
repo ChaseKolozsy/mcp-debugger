@@ -196,6 +196,18 @@ export class DebugMcpServer {
     return this.sessionManager.setBreakpoint(sessionId, file, line, condition);
   }
 
+  public async setBreakpoints(sessionId: string, file: string): Promise<{ success: boolean; breakpoints: Breakpoint[]; errors: string[] }> {
+    this.validateSession(sessionId);
+    
+    // In container mode, prepend /workspace/ to the path
+    if (process.env.MCP_CONTAINER === 'true') {
+      file = `/workspace/${file}`;
+    }
+    
+    this.logger.info(`[DebugMcpServer.setBreakpoints] Using file path: ${file}`);
+    return this.sessionManager.setBreakpoints(sessionId, file);
+  }
+
   public async getVariables(sessionId: string, variablesReference: number): Promise<Variable[]> {
     this.validateSession(sessionId);
     return this.sessionManager.getVariables(sessionId, variablesReference);
@@ -344,6 +356,7 @@ export class DebugMcpServer {
           { name: 'list_supported_languages', description: 'List all supported debugging languages with metadata', inputSchema: { type: 'object', properties: {} } },
           { name: 'list_debug_sessions', description: 'List all active debugging sessions', inputSchema: { type: 'object', properties: {} } },
           { name: 'set_breakpoint', description: 'Set a breakpoint. Setting breakpoints on non-executable lines (structural, declarative) may lead to unexpected behavior', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, file: { type: 'string', description: fileDescription }, line: { type: 'number', description: 'Line number where to set breakpoint. Executable statements (assignments, function calls, conditionals, returns) work best. Structural lines (function/class definitions), declarative lines (imports), or non-executable lines (comments, blank lines) may cause unexpected stepping behavior' }, condition: { type: 'string' } }, required: ['sessionId', 'file', 'line'] } },
+          { name: 'set_breakpoints', description: 'Set breakpoints on all executable lines in a file', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, file: { type: 'string', description: fileDescription } }, required: ['sessionId', 'file'] } },
           { name: 'start_debugging', description: 'Start debugging a script', inputSchema: { 
               type: 'object', 
               properties: { 
@@ -441,6 +454,51 @@ export class DebugMcpServer {
                 });
                 
                 result = { content: [{ type: 'text', text: JSON.stringify({ success: true, breakpointId: breakpoint.id, file: breakpoint.file, line: breakpoint.line, verified: breakpoint.verified, message: `Breakpoint set at ${breakpoint.file}:${breakpoint.line}` }) }] };
+              } catch (error) {
+                // Handle validation errors specifically
+                if (error instanceof McpError && 
+                    (error.message.includes('terminated') || 
+                     error.message.includes('closed') || 
+                     error.message.includes('not found'))) {
+                  result = { content: [{ type: 'text', text: JSON.stringify({ success: false, error: error.message }) }] };
+                } else {
+                  // Re-throw unexpected errors
+                  throw error;
+                }
+              }
+              break;
+            }
+            case 'set_breakpoints': {
+              if (!args.sessionId || !args.file) {
+                throw new McpError(McpErrorCode.InvalidParams, 'Missing required parameters');
+              }
+              
+              try {
+                const breakpointsResult = await this.setBreakpoints(args.sessionId, args.file);
+                
+                // Log breakpoints event
+                this.logger.info('debug:breakpoints', {
+                  event: 'bulk_set',
+                  sessionId: args.sessionId,
+                  sessionName: this.getSessionName(args.sessionId),
+                  file: args.file,
+                  breakpointCount: breakpointsResult.breakpoints.length,
+                  errorCount: breakpointsResult.errors.length,
+                  timestamp: Date.now()
+                });
+                
+                result = { content: [{ type: 'text', text: JSON.stringify({ 
+                  success: breakpointsResult.success, 
+                  breakpointCount: breakpointsResult.breakpoints.length,
+                  breakpoints: breakpointsResult.breakpoints.map(bp => ({ 
+                    id: bp.id, 
+                    file: bp.file, 
+                    line: bp.line, 
+                    verified: bp.verified 
+                  })),
+                  errors: breakpointsResult.errors,
+                  message: `Set ${breakpointsResult.breakpoints.length} breakpoints in ${args.file}${breakpointsResult.errors.length > 0 ? ` with ${breakpointsResult.errors.length} errors` : ''}`
+                }) }] };
               } catch (error) {
                 // Handle validation errors specifically
                 if (error instanceof McpError && 

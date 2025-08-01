@@ -408,6 +408,53 @@ export class SessionManagerOperations extends SessionManagerData {
     return newBreakpoint;
   }
 
+  async setBreakpoints(sessionId: string, file: string): Promise<{ success: boolean; breakpoints: Breakpoint[]; errors: string[] }> {
+    const { PythonLineAnalyzer } = await import('../utils/python-line-analyzer.js');
+    const analyzer = new PythonLineAnalyzer();
+    
+    this.logger.info(`[SessionManager setBreakpoints] Setting breakpoints for all executable lines in ${file}`);
+    
+    const errors: string[] = [];
+    const breakpoints: Breakpoint[] = [];
+    
+    try {
+      // Get all executable lines from the file
+      const executableLines = await analyzer.getExecutableLines(file);
+      this.logger.info(`[SessionManager setBreakpoints] Found ${executableLines.length} executable lines in ${file}`);
+      
+      // Set a breakpoint on each executable line
+      for (const line of executableLines) {
+        try {
+          const breakpoint = await this.setBreakpoint(sessionId, file, line);
+          breakpoints.push(breakpoint);
+          this.logger.debug(`[SessionManager setBreakpoints] Set breakpoint at line ${line}`);
+        } catch (error) {
+          const errorMsg = `Failed to set breakpoint at line ${line}: ${error instanceof Error ? error.message : String(error)}`;
+          errors.push(errorMsg);
+          this.logger.error(`[SessionManager setBreakpoints] ${errorMsg}`);
+        }
+      }
+      
+      this.logger.info(`[SessionManager setBreakpoints] Successfully set ${breakpoints.length} breakpoints, ${errors.length} errors`);
+      
+      return {
+        success: errors.length === 0,
+        breakpoints,
+        errors
+      };
+    } catch (error) {
+      const errorMsg = `Failed to analyze file ${file}: ${error instanceof Error ? error.message : String(error)}`;
+      errors.push(errorMsg);
+      this.logger.error(`[SessionManager setBreakpoints] ${errorMsg}`);
+      
+      return {
+        success: false,
+        breakpoints,
+        errors
+      };
+    }
+  }
+
   async stepOver(sessionId: string): Promise<DebugResult> {
     const session = this._getSessionById(sessionId);
     const threadId = session.proxyManager?.getCurrentThreadId();
