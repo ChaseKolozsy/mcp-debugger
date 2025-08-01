@@ -200,25 +200,45 @@ export class ValidationManager extends EventEmitter {
       }
       
       // Process breakpoints as we hit them - let the program run to completion naturally
+      let iterationCount = 0;
+      const maxIterations = 1000; // Safety limit to prevent infinite loops
+      
+      this.logger.info(`[ValidationManager] Starting validation loop. Initial session state: ${session.state}`);
+      
       while (session.state === 'running') {
+        iterationCount++;
+        this.logger.debug(`[ValidationManager] Validation loop iteration ${iterationCount}/${maxIterations}`);
+        
+        if (iterationCount > maxIterations) {
+          this.logger.error(`[ValidationManager] Reached maximum iteration limit (${maxIterations}), ending validation to prevent infinite loop`);
+          break;
+        }
+        
         try {
           // Wait for stopped event
+          this.logger.debug('[ValidationManager] Waiting for stopped event...');
           await this.waitForStopped(session.debugSessionId, 15000);
+          this.logger.debug('[ValidationManager] Stopped event received');
           
           // Get current position
           const stackTrace = await this.sessionManager.getStackTrace(session.debugSessionId);
           if (!stackTrace || stackTrace.length === 0) {
-            this.logger.info('[ValidationManager] Program terminated');
+            this.logger.info('[ValidationManager] VALIDATION EXIT: Program terminated - no stack trace available');
+            this.logger.info(`[ValidationManager] Final stats: ${iterationCount} iterations, ${linesProcessedThisSession.size} lines processed`);
             break;
           }
           
           const currentFrame = stackTrace[0];
           if (!currentFrame || !currentFrame.line) {
+            this.logger.debug('[ValidationManager] No current frame or line info, continuing to next breakpoint');
+            await this.sessionManager.continue(session.debugSessionId);
             continue;
           }
           
           const currentLine = currentFrame.line;
           const lineKey = `${currentFile}:${currentLine}`;
+          
+          this.logger.debug(`[ValidationManager] Processing breakpoint at line ${currentLine}: ${lines[currentLine - 1]?.trim() || 'N/A'}`);
           
           // Update session position
           session.currentFile = currentFile;
@@ -229,17 +249,28 @@ export class ValidationManager extends EventEmitter {
                                 sessionStartTime, linesProcessedThisSession);
           
           // Continue to next breakpoint
+          this.logger.debug('[ValidationManager] Continuing to next breakpoint...');
           await this.sessionManager.continue(session.debugSessionId);
           
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           
           if (errorMessage.includes('exited') || errorMessage.includes('terminated')) {
-            this.logger.info('[ValidationManager] Program terminated normally');
+            this.logger.info(`[ValidationManager] VALIDATION EXIT: Program terminated normally after ${iterationCount} iterations`);
+            this.logger.info(`[ValidationManager] Final stats: ${linesProcessedThisSession.size} lines processed`);
             break;
           }
           
-          this.logger.error(`[ValidationManager] Error during validation: ${errorMessage}`);
+          if (errorMessage.includes('timeout') || errorMessage.includes('Timeout')) {
+            this.logger.error(`[ValidationManager] VALIDATION EXIT: Timeout occurred after ${iterationCount} iterations`);
+            this.logger.error(`[ValidationManager] Timeout details: ${errorMessage}`);
+            this.logger.info(`[ValidationManager] Lines processed before timeout: ${linesProcessedThisSession.size}`);
+            break;
+          }
+          
+          this.logger.error(`[ValidationManager] Error during validation at iteration ${iterationCount}: ${errorMessage}`);
+          this.logger.error(`[ValidationManager] Current position: line ${session.currentLine || 'unknown'}`);
+          
           // Record error and try to continue
           session.errorsFound.push({
             file: session.currentFile || '',
@@ -254,12 +285,21 @@ export class ValidationManager extends EventEmitter {
           
           // Try to continue after error
           try {
+            this.logger.debug('[ValidationManager] Attempting to continue after error...');
             await this.sessionManager.continue(session.debugSessionId);
           } catch (continueError) {
-            this.logger.error('[ValidationManager] Cannot continue after error, ending validation');
+            const continueErrorMsg = continueError instanceof Error ? continueError.message : String(continueError);
+            this.logger.error(`[ValidationManager] VALIDATION EXIT: Cannot continue after error - ${continueErrorMsg}`);
+            this.logger.error(`[ValidationManager] Final position: line ${session.currentLine || 'unknown'}, iteration ${iterationCount}`);
             break;
           }
         }
+      }
+      
+      // Check why we exited the loop
+      if (session.state !== 'running') {
+        this.logger.info(`[ValidationManager] VALIDATION EXIT: Session state changed from 'running' to '${session.state}' after ${iterationCount} iterations`);
+        this.logger.info(`[ValidationManager] Final stats: ${linesProcessedThisSession.size} lines processed`);
       }
       
     } catch (error) {
