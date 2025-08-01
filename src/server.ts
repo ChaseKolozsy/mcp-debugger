@@ -25,6 +25,7 @@ import {
 import { DebugProtocol } from '@vscode/debugprotocol';
 import path from 'path';
 import { VoiceOutput, VoiceOutputConfig } from './utils/voice-output.js';
+import { VoiceFormatter } from './utils/voice-formatter.js';
 /**
  * Configuration options for the Debug MCP Server
  */
@@ -477,7 +478,8 @@ export class DebugMcpServer {
                   timestamp: Date.now()
                 });
                 
-                result = { content: [{ type: 'text', text: JSON.stringify({ success: true, breakpointId: breakpoint.id, file: breakpoint.file, line: breakpoint.line, verified: breakpoint.verified, message: `Breakpoint set at ${breakpoint.file}:${breakpoint.line}` }) }] };
+                const fileName = breakpoint.file.split('/').pop() || 'file';
+                result = { content: [{ type: 'text', text: JSON.stringify({ success: true, breakpointId: breakpoint.id, file: breakpoint.file, line: breakpoint.line, verified: breakpoint.verified, message: `Breakpoint set at ${fileName}:${breakpoint.line}` }) }] };
               } catch (error) {
                 // Handle validation errors specifically
                 if (error instanceof McpError && 
@@ -521,7 +523,7 @@ export class DebugMcpServer {
                     verified: bp.verified 
                   })),
                   errors: breakpointsResult.errors,
-                  message: `Set ${breakpointsResult.breakpoints.length} breakpoints in ${args.file}${breakpointsResult.errors.length > 0 ? ` with ${breakpointsResult.errors.length} errors` : ''}`
+                  message: `Set ${breakpointsResult.breakpoints.length} breakpoints${breakpointsResult.errors.length > 0 ? ` with ${breakpointsResult.errors.length} errors` : ''}`
                 }) }] };
               } catch (error) {
                 // Handle validation errors specifically
@@ -778,39 +780,22 @@ export class DebugMcpServer {
                   } else if (jsonData.error) {
                     spokenText = `Error: ${jsonData.error}`;
                   } else if (jsonData.variables && Array.isArray(jsonData.variables)) {
-                    // Speak detailed variable information
-                    const varCount = jsonData.variables.length;
-                    if (varCount === 0) {
-                      spokenText = 'No variables found';
-                    } else if (varCount <= 5) {
-                      // For small number of variables, speak each one
-                      const varDescriptions = jsonData.variables.map((v: any) => {
-                        const value = v.value && v.value.length > 50 ? v.value.substring(0, 50) + '...' : v.value;
-                        return `${v.name} is ${value}`;
-                      }).join(', ');
-                      spokenText = `Found ${varCount} variables: ${varDescriptions}`;
-                    } else {
-                      // For many variables, speak the first few
-                      const firstVars = jsonData.variables.slice(0, 3).map((v: any) => v.name).join(', ');
-                      spokenText = `Found ${varCount} variables including ${firstVars} and ${varCount - 3} more`;
-                    }
+                    // Use VoiceFormatter for intelligent variable formatting
+                    spokenText = VoiceFormatter.formatVariables(jsonData.variables);
                   } else if (jsonData.stackFrames && Array.isArray(jsonData.stackFrames)) {
-                    // Speak stack frame information
+                    // Use VoiceFormatter for stack frame information
                     const frameCount = jsonData.stackFrames.length;
                     if (frameCount === 0) {
                       spokenText = 'No stack frames';
                     } else {
-                      const topFrame = jsonData.stackFrames[0];
-                      const fileName = topFrame.file ? topFrame.file.split('/').pop() : 'unknown file';
-                      spokenText = `Paused at line ${topFrame.line} in ${fileName}`;
+                      spokenText = `Paused at ${VoiceFormatter.formatStackFrame(jsonData.stackFrames[0])}`;
                       if (frameCount > 1) {
                         spokenText += `, with ${frameCount - 1} more frames in the call stack`;
                       }
                     }
                   } else if (jsonData.scopes && Array.isArray(jsonData.scopes)) {
-                    // Speak scope information
-                    const scopeNames = jsonData.scopes.map((s: any) => s.name).join(', ');
-                    spokenText = `Found ${jsonData.scopes.length} scopes: ${scopeNames}`;
+                    // Use VoiceFormatter for scope information
+                    spokenText = VoiceFormatter.formatScopes(jsonData.scopes);
                   } else if (jsonData.breakpoints && Array.isArray(jsonData.breakpoints)) {
                     // Speak breakpoint information
                     const bpCount = jsonData.breakpoints.length;
