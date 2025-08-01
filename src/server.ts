@@ -11,6 +11,7 @@ import {
   McpError,
   ServerResult, 
 } from '@modelcontextprotocol/sdk/types.js';
+import * as fs from 'fs';
 import { SessionManager, SessionManagerConfig } from './session/session-manager.js';
 import { createProductionDependencies } from './container/dependencies.js';
 import { ContainerConfig } from './container/types.js';
@@ -607,6 +608,42 @@ export class DebugMcpServer {
                 } else {
                   stepResult = await this.stepOut(args.sessionId);
                 }
+                
+                // After successful step, get current location and read the line
+                if (stepResult) {
+                  try {
+                    const stackFrames = await this.getStackTrace(args.sessionId);
+                    if (stackFrames && stackFrames.length > 0) {
+                      const currentFrame = stackFrames[0];
+                      const filePath = currentFrame.file;
+                      const lineNumber = currentFrame.line;
+                      
+                      // Read the current line from the file
+                      try {
+                        const fileContent = fs.readFileSync(filePath, 'utf-8');
+                        const lines = fileContent.split('\n');
+                        const currentLine = lines[lineNumber - 1]; // Lines are 1-indexed
+                        
+                        // Speak the current line if voice output is enabled
+                        const voiceOutput = this.voiceOutputs.get(args.sessionId);
+                        if (voiceOutput && voiceOutput.isEnabled() && currentLine) {
+                          const trimmedLine = currentLine.trim();
+                          if (trimmedLine) {
+                            const fileName = filePath.split('/').pop() || 'file';
+                            await voiceOutput.speak(`Line ${lineNumber}: ${trimmedLine}`);
+                          }
+                        }
+                      } catch (fileError) {
+                        // Silently ignore file reading errors
+                        this.logger.warn('Failed to read current line for voice output', { error: fileError });
+                      }
+                    }
+                  } catch (stackError) {
+                    // Silently ignore stack trace errors
+                    this.logger.warn('Failed to get stack trace for voice output', { error: stackError });
+                  }
+                }
+                
                 result = { content: [{ type: 'text', text: JSON.stringify({ success: stepResult, message: stepResult ? `Stepped ${toolName.replace('step_', '')}` : `Failed to ${toolName.replace('_', ' ')}` }) }] };
               } catch (error) {
                 // Handle validation errors specifically
