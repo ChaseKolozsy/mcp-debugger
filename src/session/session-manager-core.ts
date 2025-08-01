@@ -106,11 +106,13 @@ export class SessionManagerCore {
     this.logger.info(`[SessionManager] Initialized. Session logs will be stored in: ${this.logDirBase}`);
   }
 
-  async createSession(params: { language: DebugLanguage; name?: string; executablePath?: string; }): Promise<DebugSessionInfo> {
+  async createSession(params: { language: DebugLanguage; name?: string; executablePath?: string; enableVoiceOutput?: boolean; voiceConfig?: { voice?: string; rate?: number; } }): Promise<DebugSessionInfo> {
     const createParams = {
       language: params.language,
       name: params.name,
-      executablePath: params.executablePath
+      executablePath: params.executablePath,
+      enableVoiceOutput: params.enableVoiceOutput,
+      voiceConfig: params.voiceConfig
     };
     const sessionInfo = this.sessionStore.createSession(createParams);
     this.logger.info(`[SessionManager] Created new session: ${sessionInfo.name} (ID: ${sessionInfo.id}), state: ${sessionInfo.state}`);

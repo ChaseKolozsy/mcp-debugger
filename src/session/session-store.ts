@@ -25,6 +25,11 @@ export interface CreateSessionParams {
   language: DebugLanguage;
   name?: string;
   executablePath?: string;  // Language-agnostic executable path
+  enableVoiceOutput?: boolean;
+  voiceConfig?: {
+    voice?: string;
+    rate?: number;
+  };
 }
 
 import { IProxyManager } from '../proxy/proxy-manager.js';
@@ -39,6 +44,12 @@ export interface ManagedSession extends DebugSessionInfo {
   // New state model fields
   sessionLifecycle: SessionLifecycleState;
   executionState?: ExecutionState;
+  // Voice output configuration
+  enableVoiceOutput?: boolean;
+  voiceConfig?: {
+    voice?: string;
+    rate?: number;
+  };
 }
 
 /**
@@ -82,6 +93,9 @@ export class SessionStore {
       // Initialize new state model
       sessionLifecycle: SessionLifecycleState.CREATED,
       executionState: undefined,
+      // Voice output configuration
+      enableVoiceOutput: params.enableVoiceOutput,
+      voiceConfig: params.voiceConfig,
     };
     
     this.sessions.set(sessionId, session);

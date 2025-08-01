@@ -24,6 +24,7 @@ import {
 } from './session/models.js';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import path from 'path';
+import { VoiceOutput, VoiceOutputConfig } from './utils/voice-output.js';
 /**
  * Configuration options for the Debug MCP Server
  */
@@ -51,6 +52,11 @@ interface ToolArguments {
   language?: string;
   name?: string;
   executablePath?: string;  // Language-agnostic executable path
+  enableVoiceOutput?: boolean;
+  voiceConfig?: {
+    voice?: string;
+    rate?: number;
+  };
   file?: string;
   line?: number;
   condition?: string;
@@ -73,6 +79,7 @@ export class DebugMcpServer {
   private logger;
   private constructorOptions: DebugMcpServerOptions;
   private supportedLanguages: string[] = [];
+  private voiceOutputs: Map<string, VoiceOutput> = new Map();
 
   // Get supported languages from adapter registry
   private getSupportedLanguages(): string[] {
@@ -129,7 +136,7 @@ export class DebugMcpServer {
   }
 
   // Public methods to expose SessionManager functionality for testing/external use
-  public async createDebugSession(params: { language: DebugLanguage; name?: string; executablePath?: string; }): Promise<DebugSessionInfo> {
+  public async createDebugSession(params: { language: DebugLanguage; name?: string; executablePath?: string; enableVoiceOutput?: boolean; voiceConfig?: { voice?: string; rate?: number; } }): Promise<DebugSessionInfo> {
     // Validate language support
     const adapterRegistry = this.getAdapterRegistry();
     if (!adapterRegistry.isLanguageSupported(params.language)) {
@@ -145,8 +152,21 @@ export class DebugMcpServer {
       const sessionInfo: DebugSessionInfo = await this.sessionManager.createSession({
         language: params.language as DebugLanguage,
         name: name,
-        executablePath: params.executablePath  // Use executablePath for consistency
+        executablePath: params.executablePath,  // Use executablePath for consistency
+        enableVoiceOutput: params.enableVoiceOutput,
+        voiceConfig: params.voiceConfig
       });
+      
+      // Create VoiceOutput instance if voice is enabled
+      if (params.enableVoiceOutput) {
+        const voiceConfig: VoiceOutputConfig = {
+          enabled: true,
+          voice: params.voiceConfig?.voice,
+          rate: params.voiceConfig?.rate
+        };
+        const voiceOutput = new VoiceOutput(voiceConfig, this.logger);
+        this.voiceOutputs.set(sessionInfo.id, voiceOutput);
+      }
       return sessionInfo;
     } catch (error) {
       const errorMessage = (error as Error).message || String(error);
@@ -181,6 +201,8 @@ export class DebugMcpServer {
   }
 
   public async closeDebugSession(sessionId: string): Promise<boolean> {
+    // Clean up voice output for this session
+    this.voiceOutputs.delete(sessionId);
     return this.sessionManager.closeSession(sessionId);
   }
 
@@ -352,7 +374,7 @@ export class DebugMcpServer {
       
       return {
         tools: [
-          { name: 'create_debug_session', description: 'Create a new debugging session', inputSchema: { type: 'object', properties: { language: { type: 'string', enum: supportedLanguages, description: 'Programming language for debugging' }, name: { type: 'string', description: 'Optional session name' }, executablePath: {type: 'string', description: 'Path to language executable (optional, will auto-detect if not provided)'} }, required: ['language'] } },
+          { name: 'create_debug_session', description: 'Create a new debugging session', inputSchema: { type: 'object', properties: { language: { type: 'string', enum: supportedLanguages, description: 'Programming language for debugging' }, name: { type: 'string', description: 'Optional session name' }, executablePath: {type: 'string', description: 'Path to language executable (optional, will auto-detect if not provided)'}, enableVoiceOutput: { type: 'boolean', description: 'Enable macOS voice output for all responses' }, voiceConfig: { type: 'object', properties: { voice: { type: 'string', description: 'macOS voice name (e.g., Alex, Samantha)' }, rate: { type: 'number', description: 'Speech rate in words per minute' } } } }, required: ['language'] } },
           { name: 'list_supported_languages', description: 'List all supported debugging languages with metadata', inputSchema: { type: 'object', properties: {} } },
           { name: 'list_debug_sessions', description: 'List all active debugging sessions', inputSchema: { type: 'object', properties: {} } },
           { name: 'set_breakpoint', description: 'Set a breakpoint. Setting breakpoints on non-executable lines (structural, declarative) may lead to unexpected behavior', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, file: { type: 'string', description: fileDescription }, line: { type: 'number', description: 'Line number where to set breakpoint. Executable statements (assignments, function calls, conditionals, returns) work best. Structural lines (function/class definitions), declarative lines (imports), or non-executable lines (comments, blank lines) may cause unexpected stepping behavior' }, condition: { type: 'string' } }, required: ['sessionId', 'file', 'line'] } },
@@ -414,7 +436,9 @@ export class DebugMcpServer {
               const sessionInfo = await this.createDebugSession({
                 language: (args.language || 'python') as DebugLanguage,
                 name: args.name,
-                executablePath: args.executablePath
+                executablePath: args.executablePath,
+                enableVoiceOutput: args.enableVoiceOutput,
+                voiceConfig: args.voiceConfig
               });
               
               // Log session creation
@@ -736,6 +760,50 @@ export class DebugMcpServer {
             success: true,
             timestamp: Date.now()
           });
+          
+          // Speak the result if voice output is enabled for the session
+          if (args.sessionId && 'content' in result && result.content && Array.isArray(result.content) && result.content.length > 0) {
+            const voiceOutput = this.voiceOutputs.get(args.sessionId);
+            if (voiceOutput && voiceOutput.isEnabled()) {
+              const textContent = result.content.find((c: any) => c.type === 'text');
+              if (textContent && 'text' in textContent) {
+                // Parse JSON to extract a readable message
+                try {
+                  const jsonData = JSON.parse(textContent.text);
+                  let spokenText = '';
+                  
+                  // Extract meaningful text from different response types
+                  if (jsonData.message) {
+                    spokenText = jsonData.message;
+                  } else if (jsonData.error) {
+                    spokenText = `Error: ${jsonData.error}`;
+                  } else if (jsonData.variables) {
+                    spokenText = `Found ${jsonData.variables.length} variables`;
+                  } else if (jsonData.frames) {
+                    spokenText = `Stack trace has ${jsonData.frames.length} frames`;
+                  } else if (jsonData.scopes) {
+                    spokenText = `Found ${jsonData.scopes.length} scopes`;
+                  } else if (jsonData.breakpointCount !== undefined) {
+                    spokenText = `Set ${jsonData.breakpointCount} breakpoints`;
+                  } else if (jsonData.sessions) {
+                    spokenText = `Found ${jsonData.count || jsonData.sessions.length} debug sessions`;
+                  } else if (toolName === 'continue_execution' && jsonData.success) {
+                    spokenText = 'Continuing execution';
+                  } else if (toolName.startsWith('step_') && jsonData.success) {
+                    spokenText = `${toolName.replace('_', ' ')} completed`;
+                  }
+                  
+                  if (spokenText) {
+                    // Use async speak to not block the response
+                    voiceOutput.speakAsync(spokenText);
+                  }
+                } catch (parseError) {
+                  // If not JSON, speak the raw text
+                  voiceOutput.speakAsync(textContent.text);
+                }
+              }
+            }
+          }
           
           return result;
         } catch (error) {
