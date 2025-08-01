@@ -141,11 +141,29 @@ export class ValidationManager extends EventEmitter {
       const lines = fileContent.split('\n');
       const totalLines = lines.length;
       
-      this.logger.info(`[ValidationManager] Setting breakpoints for all ${totalLines} lines in ${currentFile}`);
+      this.logger.info(`[ValidationManager] Analyzing ${totalLines} lines in ${currentFile} for executable breakpoints`);
       
-      // Set breakpoints on every line (scatter-shot approach)
+      // Set breakpoints only on executable lines (smart scatter-shot approach)
       const breakpointLines: number[] = [];
       for (let lineNum = 1; lineNum <= totalLines; lineNum++) {
+        const lineContent = lines[lineNum - 1] || '';
+        const trimmed = lineContent.trim();
+        
+        // Skip empty lines
+        if (trimmed.length === 0) {
+          continue;
+        }
+        
+        // Skip comment lines
+        if (trimmed.startsWith('#')) {
+          continue;
+        }
+        
+        // Skip docstring lines (simple detection)
+        if (trimmed.startsWith('"""') || trimmed.startsWith("'''")) {
+          continue;
+        }
+        
         // Skip lines that were cleared in previous sessions
         if (session.config.skipCleared && await store.isLineCleared(currentFile, lineNum)) {
           const fileState = await store.getFileState(currentFile);
@@ -154,22 +172,35 @@ export class ValidationManager extends EventEmitter {
             continue;
           }
         }
+        
         breakpointLines.push(lineNum);
       }
       
+      // Remove duplicates and sort
+      const uniqueBreakpointLines = [...new Set(breakpointLines)].sort((a, b) => a - b);
+      
+      this.logger.info(`[ValidationManager] Requesting ${uniqueBreakpointLines.length} breakpoints on executable lines`);
+      
       // Set all breakpoints at once
-      const bpResponse = await this.setBreakpointsForFile(session.debugSessionId, currentFile, breakpointLines);
+      const bpResponse = await this.setBreakpointsForFile(session.debugSessionId, currentFile, uniqueBreakpointLines);
       const verifiedBreakpoints = bpResponse.filter(bp => bp.verified);
       
-      this.logger.info(`[ValidationManager] Set ${verifiedBreakpoints.length} verified breakpoints out of ${breakpointLines.length} requested`);
+      this.logger.info(`[ValidationManager] Set ${verifiedBreakpoints.length} verified breakpoints out of ${uniqueBreakpointLines.length} requested`);
       
-      // Continue execution to hit first breakpoint
-      if (verifiedBreakpoints.length > 0) {
+      // Check if we're already stopped at a breakpoint
+      const initialStackTrace = await this.sessionManager.getStackTrace(session.debugSessionId);
+      const alreadyStopped = initialStackTrace && initialStackTrace.length > 0;
+      
+      // Only continue if we're not already stopped
+      if (verifiedBreakpoints.length > 0 && !alreadyStopped) {
         await this.sessionManager.continue(session.debugSessionId);
       }
       
+      // Track processed breakpoints to avoid re-processing and to know when we're done
+      const processedBreakpoints = new Set<number>();
+      
       // Process breakpoints as we hit them
-      while (session.state === 'running' && verifiedBreakpoints.length > 0) {
+      while (session.state === 'running' && processedBreakpoints.size < verifiedBreakpoints.length) {
         try {
           // Wait for stopped event
           await this.waitForStopped(session.debugSessionId, 15000);
@@ -193,24 +224,22 @@ export class ValidationManager extends EventEmitter {
           session.currentFile = currentFile;
           session.currentLine = currentLine;
           
-          // Process the line
+          // Skip if we've already processed this line
+          if (processedBreakpoints.has(currentLine)) {
+            this.logger.debug(`[ValidationManager] Already processed line ${currentLine}, continuing without speaking`);
+            await this.sessionManager.continue(session.debugSessionId);
+            continue;
+          }
+          
+          // Process the line (this will speak it)
           await this.processLine(session, store, currentFile, currentLine, lines[currentLine - 1] || '', 
                                 sessionStartTime, linesProcessedThisSession);
           
-          // Remove this breakpoint from our list
-          const bpIndex = verifiedBreakpoints.findIndex(bp => bp.line === currentLine);
-          if (bpIndex >= 0) {
-            verifiedBreakpoints.splice(bpIndex, 1);
-          }
+          // Track that we've processed this breakpoint
+          processedBreakpoints.add(currentLine);
           
-          // Update breakpoints (remove the one we just hit)
-          const remainingLines = verifiedBreakpoints.map(bp => bp.line || 0).filter(line => line > 0);
-          await this.setBreakpointsForFile(session.debugSessionId, currentFile, remainingLines);
-          
-          // Continue to next breakpoint if any remain
-          if (remainingLines.length > 0) {
-            await this.sessionManager.continue(session.debugSessionId);
-          }
+          // Continue to next breakpoint
+          await this.sessionManager.continue(session.debugSessionId);
           
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
@@ -233,8 +262,8 @@ export class ValidationManager extends EventEmitter {
             await this.speakError(errorMessage, session.config.voiceRate);
           }
           
-          // Try to continue to next breakpoint
-          if (verifiedBreakpoints.length > 0) {
+          // Try to continue to next breakpoint if we haven't processed all of them
+          if (processedBreakpoints.size < verifiedBreakpoints.length) {
             try {
               await this.sessionManager.continue(session.debugSessionId);
             } catch (continueError) {
