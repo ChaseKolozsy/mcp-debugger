@@ -199,11 +199,8 @@ export class ValidationManager extends EventEmitter {
         await this.sessionManager.continue(session.debugSessionId);
       }
       
-      // Track processed breakpoints to avoid re-processing and to know when we're done
-      const processedBreakpoints = new Set<number>();
-      
-      // Process breakpoints as we hit them
-      while (session.state === 'running' && processedBreakpoints.size < verifiedBreakpoints.length) {
+      // Process breakpoints as we hit them - let the program run to completion naturally
+      while (session.state === 'running') {
         try {
           // Wait for stopped event
           await this.waitForStopped(session.debugSessionId, 15000);
@@ -227,19 +224,9 @@ export class ValidationManager extends EventEmitter {
           session.currentFile = currentFile;
           session.currentLine = currentLine;
           
-          // For line-by-line validation, we want to speak every hit, even repeated ones
-          // But we still track processed lines to know when validation is complete
-          const alreadyProcessed = processedBreakpoints.has(currentLine);
-          if (alreadyProcessed) {
-            this.logger.debug(`[ValidationManager] Line ${currentLine} already processed, but speaking again for completeness`);
-          }
-          
-          // Process the line (this will speak it)
+          // Process the line (this will speak it and track it)
           await this.processLine(session, store, currentFile, currentLine, lines[currentLine - 1] || '', 
                                 sessionStartTime, linesProcessedThisSession);
-          
-          // Track that we've processed this breakpoint
-          processedBreakpoints.add(currentLine);
           
           // Continue to next breakpoint
           await this.sessionManager.continue(session.debugSessionId);
@@ -265,14 +252,12 @@ export class ValidationManager extends EventEmitter {
             await this.speakError(errorMessage, session.config.voiceRate);
           }
           
-          // Try to continue to next breakpoint if we haven't processed all of them
-          if (processedBreakpoints.size < verifiedBreakpoints.length) {
-            try {
-              await this.sessionManager.continue(session.debugSessionId);
-            } catch (continueError) {
-              this.logger.error('[ValidationManager] Cannot continue after error, ending validation');
-              break;
-            }
+          // Try to continue after error
+          try {
+            await this.sessionManager.continue(session.debugSessionId);
+          } catch (continueError) {
+            this.logger.error('[ValidationManager] Cannot continue after error, ending validation');
+            break;
           }
         }
       }
@@ -305,12 +290,127 @@ export class ValidationManager extends EventEmitter {
     const lineInfo = this.analyzeLine(currentFile, currentLine, lineContent);
     
     if (session.config.mode === 'pair' && session.config.voiceEnabled) {
-      await this.speakLine(lineInfo, session.config.voiceRate);
+      // If this is a function call, try to evaluate arguments
+      let enhancedContent = lineContent;
+      if (lineInfo.type === 'function_call') {
+        enhancedContent = await this.enhanceFunctionCallWithValues(session.debugSessionId, lineContent);
+      }
+      
+      const enhancedLineInfo = { ...lineInfo, content: enhancedContent };
+      await this.speakLine(enhancedLineInfo, session.config.voiceRate);
     }
     
     // Always mark line as cleared when encountered during execution
     await store.markLineCleared(currentFile, currentLine);
     session.totalLinesValidated++;
+  }
+
+  /**
+   * Enhance function call lines by evaluating argument values
+   */
+  private async enhanceFunctionCallWithValues(sessionId: string, lineContent: string): Promise<string> {
+    try {
+      // Match function calls with arguments like self.add_data(data)
+      const functionCallRegex = /(\w+(?:\.\w+)*)\s*\(([^)]*)\)/g;
+      let enhancedContent = lineContent;
+      let match;
+      
+      while ((match = functionCallRegex.exec(lineContent)) !== null) {
+        const functionName = match[1];
+        const argsString = match[2].trim();
+        
+        if (argsString && !argsString.includes('"') && !argsString.includes("'") && !argsString.match(/^\d+$/)) {
+          // This looks like a variable argument, try to evaluate it
+          try {
+            // Get current stack frame variables
+            const scopes = await this.getVariablesInCurrentScope(sessionId);
+            const argValue = await this.evaluateArgument(argsString, scopes);
+            
+            if (argValue !== null) {
+              // Replace the argument with its evaluated value
+              const originalCall = match[0];
+              const enhancedCall = `${functionName}(${JSON.stringify(argValue)})`;
+              enhancedContent = enhancedContent.replace(originalCall, enhancedCall);
+            }
+          } catch (error) {
+            // If evaluation fails, keep original
+            this.logger.debug(`[ValidationManager] Failed to evaluate argument ${argsString}: ${error}`);
+          }
+        }
+      }
+      
+      return enhancedContent;
+    } catch (error) {
+      this.logger.debug(`[ValidationManager] Error enhancing function call: ${error}`);
+      return lineContent;
+    }
+  }
+
+  /**
+   * Get variables in the current scope
+   */
+  private async getVariablesInCurrentScope(sessionId: string): Promise<Record<string, any>> {
+    try {
+      const stackTrace = await this.sessionManager.getStackTrace(sessionId);
+      if (!stackTrace || stackTrace.length === 0) {
+        return {};
+      }
+      
+      const currentFrame = stackTrace[0];
+      const scopes = await this.sessionManager.getScopes(sessionId, currentFrame.id);
+      
+      const variables: Record<string, any> = {};
+      for (const scope of scopes) {
+        if (scope.name === 'Locals' || scope.name === 'Arguments') {
+          const scopeVars = await this.sessionManager.getVariables(sessionId, scope.variablesReference);
+          for (const variable of scopeVars) {
+            variables[variable.name] = this.parseVariableValue(variable.value);
+          }
+        }
+      }
+      
+      return variables;
+    } catch (error) {
+      this.logger.debug(`[ValidationManager] Error getting variables: ${error}`);
+      return {};
+    }
+  }
+
+  /**
+   * Evaluate an argument string using current scope variables
+   */
+  private async evaluateArgument(argString: string, variables: Record<string, any>): Promise<any> {
+    const trimmed = argString.trim();
+    
+    // Simple variable lookup
+    if (variables.hasOwnProperty(trimmed)) {
+      return variables[trimmed];
+    }
+    
+    return null;
+  }
+
+  /**
+   * Parse variable value from debugger string representation
+   */
+  private parseVariableValue(valueString: string): any {
+    if (valueString === 'None') return null;
+    if (valueString === 'True') return true;
+    if (valueString === 'False') return false;
+    
+    // Try to parse as number
+    const numValue = Number(valueString);
+    if (!isNaN(numValue)) return numValue;
+    
+    // Return as string if it looks like a string
+    if (valueString.startsWith("'") && valueString.endsWith("'")) {
+      return valueString.slice(1, -1);
+    }
+    if (valueString.startsWith('"') && valueString.endsWith('"')) {
+      return valueString.slice(1, -1);
+    }
+    
+    return valueString;
   }
 
   /**
