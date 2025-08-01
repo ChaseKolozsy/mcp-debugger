@@ -91,6 +91,9 @@ export class ValidationManager extends EventEmitter {
       
       this.logger.info(`[ValidationManager] Debug session state: ${debugSession.state}, execution: ${executionState}`);
       
+      // Ensure justMyCode is disabled for comprehensive debugging
+      this.logger.info('[ValidationManager] Ensuring justMyCode is disabled for comprehensive validation');
+      
       // If not paused, we need to wait for it
       if (executionState !== ExecutionState.PAUSED) {
         this.logger.info('[ValidationManager] Waiting for debug session to pause...');
@@ -224,11 +227,11 @@ export class ValidationManager extends EventEmitter {
           session.currentFile = currentFile;
           session.currentLine = currentLine;
           
-          // Skip if we've already processed this line
-          if (processedBreakpoints.has(currentLine)) {
-            this.logger.debug(`[ValidationManager] Already processed line ${currentLine}, continuing without speaking`);
-            await this.sessionManager.continue(session.debugSessionId);
-            continue;
+          // For line-by-line validation, we want to speak every hit, even repeated ones
+          // But we still track processed lines to know when validation is complete
+          const alreadyProcessed = processedBreakpoints.has(currentLine);
+          if (alreadyProcessed) {
+            this.logger.debug(`[ValidationManager] Line ${currentLine} already processed, but speaking again for completeness`);
           }
           
           // Process the line (this will speak it)
@@ -297,26 +300,15 @@ export class ValidationManager extends EventEmitter {
     const lineKey = `${currentFile}:${currentLine}`;
     linesProcessedThisSession.add(lineKey);
     
-    // Check if line was cleared in a previous session
-    let shouldSkipReading = false;
-    if (session.config.skipCleared && await store.isLineCleared(currentFile, currentLine)) {
-      const fileState = await store.getFileState(currentFile);
-      if (fileState && fileState.lastModified < sessionStartTime) {
-        shouldSkipReading = true;
-        this.logger.debug(`[ValidationManager] Line ${lineKey} was cleared in previous session`);
-      }
+    // Always analyze and speak the line during execution stepping
+    // The skipCleared logic should only be used during initial breakpoint setting
+    const lineInfo = this.analyzeLine(currentFile, currentLine, lineContent);
+    
+    if (session.config.mode === 'pair' && session.config.voiceEnabled) {
+      await this.speakLine(lineInfo, session.config.voiceRate);
     }
     
-    if (!shouldSkipReading) {
-      // Analyze and speak the line
-      const lineInfo = this.analyzeLine(currentFile, currentLine, lineContent);
-      
-      if (session.config.mode === 'pair' && session.config.voiceEnabled) {
-        await this.speakLine(lineInfo, session.config.voiceRate);
-      }
-    }
-    
-    // Mark line as cleared
+    // Always mark line as cleared when encountered during execution
     await store.markLineCleared(currentFile, currentLine);
     session.totalLinesValidated++;
   }
