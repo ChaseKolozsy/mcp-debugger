@@ -777,12 +777,64 @@ export class DebugMcpServer {
                     spokenText = jsonData.message;
                   } else if (jsonData.error) {
                     spokenText = `Error: ${jsonData.error}`;
-                  } else if (jsonData.variables) {
-                    spokenText = `Found ${jsonData.variables.length} variables`;
-                  } else if (jsonData.frames) {
-                    spokenText = `Stack trace has ${jsonData.frames.length} frames`;
-                  } else if (jsonData.scopes) {
-                    spokenText = `Found ${jsonData.scopes.length} scopes`;
+                  } else if (jsonData.variables && Array.isArray(jsonData.variables)) {
+                    // Speak detailed variable information
+                    const varCount = jsonData.variables.length;
+                    if (varCount === 0) {
+                      spokenText = 'No variables found';
+                    } else if (varCount <= 5) {
+                      // For small number of variables, speak each one
+                      const varDescriptions = jsonData.variables.map((v: any) => {
+                        const value = v.value && v.value.length > 50 ? v.value.substring(0, 50) + '...' : v.value;
+                        return `${v.name} is ${value}`;
+                      }).join(', ');
+                      spokenText = `Found ${varCount} variables: ${varDescriptions}`;
+                    } else {
+                      // For many variables, speak the first few
+                      const firstVars = jsonData.variables.slice(0, 3).map((v: any) => v.name).join(', ');
+                      spokenText = `Found ${varCount} variables including ${firstVars} and ${varCount - 3} more`;
+                    }
+                  } else if (jsonData.stackFrames && Array.isArray(jsonData.stackFrames)) {
+                    // Speak stack frame information
+                    const frameCount = jsonData.stackFrames.length;
+                    if (frameCount === 0) {
+                      spokenText = 'No stack frames';
+                    } else {
+                      const topFrame = jsonData.stackFrames[0];
+                      const fileName = topFrame.file ? topFrame.file.split('/').pop() : 'unknown file';
+                      spokenText = `Paused at line ${topFrame.line} in ${fileName}`;
+                      if (frameCount > 1) {
+                        spokenText += `, with ${frameCount - 1} more frames in the call stack`;
+                      }
+                    }
+                  } else if (jsonData.scopes && Array.isArray(jsonData.scopes)) {
+                    // Speak scope information
+                    const scopeNames = jsonData.scopes.map((s: any) => s.name).join(', ');
+                    spokenText = `Found ${jsonData.scopes.length} scopes: ${scopeNames}`;
+                  } else if (jsonData.breakpoints && Array.isArray(jsonData.breakpoints)) {
+                    // Speak breakpoint information
+                    const bpCount = jsonData.breakpoints.length;
+                    if (bpCount === 0) {
+                      spokenText = 'No breakpoints set';
+                    } else if (bpCount === 1) {
+                      const bp = jsonData.breakpoints[0];
+                      spokenText = `Set breakpoint at line ${bp.line}`;
+                    } else {
+                      spokenText = `Set ${bpCount} breakpoints`;
+                    }
+                  } else if (jsonData.state) {
+                    // Speak state changes
+                    spokenText = `Debugger state: ${jsonData.state}`;
+                    if (jsonData.data && jsonData.data.reason) {
+                      spokenText += ` due to ${jsonData.data.reason}`;
+                    }
+                  } else if (jsonData.breakpointCount !== undefined) {
+                    // Speak bulk breakpoint results
+                    if (jsonData.errors && jsonData.errors.length > 0) {
+                      spokenText = `Set ${jsonData.breakpointCount} breakpoints with ${jsonData.errors.length} errors`;
+                    } else {
+                      spokenText = `Successfully set ${jsonData.breakpointCount} breakpoints`;
+                    }
                   } else if (jsonData.breakpointCount !== undefined) {
                     spokenText = `Set ${jsonData.breakpointCount} breakpoints`;
                   } else if (jsonData.sessions) {
