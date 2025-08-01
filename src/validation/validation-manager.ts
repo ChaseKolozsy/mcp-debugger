@@ -15,6 +15,7 @@ import { ClearedLinesStore } from './cleared-lines-store.js';
 import { SessionManager } from '../session/session-manager.js';
 import { ExecutionState } from '../session/models.js';
 import { v4 as uuidv4 } from 'uuid';
+import { DebugProtocol } from '@vscode/debugprotocol';
 
 export class ValidationManager extends EventEmitter {
   private sessions = new Map<string, ValidationSession>();
@@ -122,122 +123,197 @@ export class ValidationManager extends EventEmitter {
   }
 
   /**
-   * Main validation loop - follows execution flow
+   * Main validation loop - uses scatter-shot breakpoint approach
    */
   private async validateExecution(
     session: ValidationSession,
     store: ClearedLinesStore
   ): Promise<void> {
-    const processedLines = new Set<string>(); // Track file:line combinations
-
-    while (session.state === 'running') {
-      try {
-        // Get current execution position
-        const stackTrace = await this.sessionManager.getStackTrace(session.debugSessionId);
-        if (!stackTrace || stackTrace.length === 0) {
-          this.logger.warn('[ValidationManager] No stack trace available, ending validation');
-          break;
+    const sessionStartTime = new Date();
+    const linesProcessedThisSession = new Set<string>();
+    
+    try {
+      // Get the file we're validating
+      const currentFile = path.resolve(session.config.startFile);
+      
+      // Read the file to get total lines
+      const fileContent = await this.fileSystem.readFile(currentFile, 'utf-8');
+      const lines = fileContent.split('\n');
+      const totalLines = lines.length;
+      
+      this.logger.info(`[ValidationManager] Setting breakpoints for all ${totalLines} lines in ${currentFile}`);
+      
+      // Set breakpoints on every line (scatter-shot approach)
+      const breakpointLines: number[] = [];
+      for (let lineNum = 1; lineNum <= totalLines; lineNum++) {
+        // Skip lines that were cleared in previous sessions
+        if (session.config.skipCleared && await store.isLineCleared(currentFile, lineNum)) {
+          const fileState = await store.getFileState(currentFile);
+          if (fileState && fileState.lastModified < sessionStartTime) {
+            this.logger.debug(`[ValidationManager] Skipping breakpoint at line ${lineNum} - already cleared`);
+            continue;
+          }
         }
-
-        const currentFrame = stackTrace[0];
-        if (!currentFrame || !currentFrame.file || !currentFrame.line) {
-          this.logger.warn('[ValidationManager] Invalid stack frame, ending validation');
-          break;
-        }
-
-        const currentFile = path.resolve(currentFrame.file);
-        const currentLine = currentFrame.line;
-        const lineKey = `${currentFile}:${currentLine}`;
-
-        // Update session position
-        session.currentFile = currentFile;
-        session.currentLine = currentLine;
-
-        // Check if we've already processed this exact line in this session
-        if (processedLines.has(lineKey)) {
-          this.logger.debug(`[ValidationManager] Already processed ${lineKey} in this session, stepping over`);
-          await this.stepAndWait(session);
-          continue;
-        }
-
-        processedLines.add(lineKey);
-
-        // Check if line is already cleared from previous runs
-        if (session.config.skipCleared && await store.isLineCleared(currentFile, currentLine)) {
-          this.logger.debug(`[ValidationManager] Line ${lineKey} already cleared, stepping over`);
-          await this.stepAndWait(session);
-          continue;
-        }
-
-        // Read the line content
-        let lineContent = '';
+        breakpointLines.push(lineNum);
+      }
+      
+      // Set all breakpoints at once
+      const bpResponse = await this.setBreakpointsForFile(session.debugSessionId, currentFile, breakpointLines);
+      const verifiedBreakpoints = bpResponse.filter(bp => bp.verified);
+      
+      this.logger.info(`[ValidationManager] Set ${verifiedBreakpoints.length} verified breakpoints out of ${breakpointLines.length} requested`);
+      
+      // Continue execution to hit first breakpoint
+      if (verifiedBreakpoints.length > 0) {
+        await this.sessionManager.continue(session.debugSessionId);
+      }
+      
+      // Process breakpoints as we hit them
+      while (session.state === 'running' && verifiedBreakpoints.length > 0) {
         try {
-          const fileContent = await this.fileSystem.readFile(currentFile, 'utf-8');
-          const lines = fileContent.split('\n');
-          lineContent = lines[currentLine - 1] || '';
+          // Wait for stopped event
+          await this.waitForStopped(session.debugSessionId, 15000);
+          
+          // Get current position
+          const stackTrace = await this.sessionManager.getStackTrace(session.debugSessionId);
+          if (!stackTrace || stackTrace.length === 0) {
+            this.logger.info('[ValidationManager] Program terminated');
+            break;
+          }
+          
+          const currentFrame = stackTrace[0];
+          if (!currentFrame || !currentFrame.line) {
+            continue;
+          }
+          
+          const currentLine = currentFrame.line;
+          const lineKey = `${currentFile}:${currentLine}`;
+          
+          // Update session position
+          session.currentFile = currentFile;
+          session.currentLine = currentLine;
+          
+          // Process the line
+          await this.processLine(session, store, currentFile, currentLine, lines[currentLine - 1] || '', 
+                                sessionStartTime, linesProcessedThisSession);
+          
+          // Remove this breakpoint from our list
+          const bpIndex = verifiedBreakpoints.findIndex(bp => bp.line === currentLine);
+          if (bpIndex >= 0) {
+            verifiedBreakpoints.splice(bpIndex, 1);
+          }
+          
+          // Update breakpoints (remove the one we just hit)
+          const remainingLines = verifiedBreakpoints.map(bp => bp.line || 0).filter(line => line > 0);
+          await this.setBreakpointsForFile(session.debugSessionId, currentFile, remainingLines);
+          
+          // Continue to next breakpoint if any remain
+          if (remainingLines.length > 0) {
+            await this.sessionManager.continue(session.debugSessionId);
+          }
+          
         } catch (error) {
-          this.logger.warn(`[ValidationManager] Could not read file ${currentFile}: ${error}`);
-        }
-
-        // Analyze the line
-        const lineInfo = this.analyzeLine(currentFile, currentLine, lineContent);
-
-        // In pair mode, speak the line
-        if (session.config.mode === 'pair' && session.config.voiceEnabled) {
-          await this.speakLine(lineInfo, session.config.voiceRate);
-        }
-
-        // Check if we should step into or over
-        let shouldStepInto = false;
-        if (session.config.followCalls && this.looksLikeFunctionCall(lineContent)) {
-          shouldStepInto = true;
-        }
-
-        // Perform the step
-        if (shouldStepInto) {
-          await this.stepIntoAndWait(session);
-        } else {
-          await this.stepAndWait(session);
-        }
-
-        // Mark line as cleared
-        await store.markLineCleared(currentFile, currentLine);
-        session.totalLinesValidated++;
-
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        
-        // Check if it's a normal termination
-        if (errorMessage.includes('exited') || errorMessage.includes('terminated')) {
-          this.logger.info('[ValidationManager] Program terminated normally');
-          break;
-        }
-
-        // Record the error
-        const validationError: ValidationError = {
-          file: session.currentFile || '',
-          line: session.currentLine || 0,
-          error: errorMessage,
-          occurredAt: new Date()
-        };
-        
-        session.errorsFound.push(validationError);
-        this.logger.error(`[ValidationManager] Error at ${session.currentFile}:${session.currentLine}: ${errorMessage}`);
-
-        // In pair mode, speak the error
-        if (session.config.mode === 'pair' && session.config.voiceEnabled) {
-          await this.speakError(errorMessage, session.config.voiceRate);
-        }
-
-        // Try to continue
-        try {
-          await this.stepAndWait(session);
-        } catch (stepError) {
-          this.logger.error('[ValidationManager] Cannot continue after error, ending validation');
-          break;
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          
+          if (errorMessage.includes('exited') || errorMessage.includes('terminated')) {
+            this.logger.info('[ValidationManager] Program terminated normally');
+            break;
+          }
+          
+          this.logger.error(`[ValidationManager] Error during validation: ${errorMessage}`);
+          // Record error and try to continue
+          session.errorsFound.push({
+            file: session.currentFile || '',
+            line: session.currentLine || 0,
+            error: errorMessage,
+            occurredAt: new Date()
+          });
+          
+          if (session.config.mode === 'pair' && session.config.voiceEnabled) {
+            await this.speakError(errorMessage, session.config.voiceRate);
+          }
+          
+          // Try to continue to next breakpoint
+          if (verifiedBreakpoints.length > 0) {
+            try {
+              await this.sessionManager.continue(session.debugSessionId);
+            } catch (continueError) {
+              this.logger.error('[ValidationManager] Cannot continue after error, ending validation');
+              break;
+            }
+          }
         }
       }
+      
+    } catch (error) {
+      throw error;
+    } finally {
+      // Clear all breakpoints
+      await this.setBreakpointsForFile(session.debugSessionId, session.config.startFile, []);
     }
+  }
+
+  /**
+   * Process a single line during validation
+   */
+  private async processLine(
+    session: ValidationSession,
+    store: ClearedLinesStore,
+    currentFile: string,
+    currentLine: number,
+    lineContent: string,
+    sessionStartTime: Date,
+    linesProcessedThisSession: Set<string>
+  ): Promise<void> {
+    const lineKey = `${currentFile}:${currentLine}`;
+    linesProcessedThisSession.add(lineKey);
+    
+    // Check if line was cleared in a previous session
+    let shouldSkipReading = false;
+    if (session.config.skipCleared && await store.isLineCleared(currentFile, currentLine)) {
+      const fileState = await store.getFileState(currentFile);
+      if (fileState && fileState.lastModified < sessionStartTime) {
+        shouldSkipReading = true;
+        this.logger.debug(`[ValidationManager] Line ${lineKey} was cleared in previous session`);
+      }
+    }
+    
+    if (!shouldSkipReading) {
+      // Analyze and speak the line
+      const lineInfo = this.analyzeLine(currentFile, currentLine, lineContent);
+      
+      if (session.config.mode === 'pair' && session.config.voiceEnabled) {
+        await this.speakLine(lineInfo, session.config.voiceRate);
+      }
+    }
+    
+    // Mark line as cleared
+    await store.markLineCleared(currentFile, currentLine);
+    session.totalLinesValidated++;
+  }
+
+  /**
+   * Set breakpoints for a file using the debug session's proxy manager
+   */
+  private async setBreakpointsForFile(
+    sessionId: string,
+    filePath: string,
+    lines: number[]
+  ): Promise<DebugProtocol.Breakpoint[]> {
+    const session = this.sessionManager.getSession(sessionId);
+    if (!session?.proxyManager) {
+      throw new Error('No proxy manager available');
+    }
+    
+    const response = await session.proxyManager.sendDapRequest<DebugProtocol.SetBreakpointsResponse>(
+      'setBreakpoints',
+      {
+        source: { path: filePath },
+        breakpoints: lines.map(line => ({ line }))
+      }
+    );
+    
+    return response.body?.breakpoints || [];
   }
 
   /**
