@@ -27,6 +27,7 @@ import { DebugProtocol } from '@vscode/debugprotocol';
 import path from 'path';
 import { VoiceOutput, VoiceOutputConfig } from './utils/voice-output.js';
 import { VoiceFormatter } from './utils/voice-formatter.js';
+import { LineReportStore, LineReport, SessionSummary } from './utils/line-report-store.js';
 /**
  * Configuration options for the Debug MCP Server
  */
@@ -82,6 +83,7 @@ export class DebugMcpServer {
   private constructorOptions: DebugMcpServerOptions;
   private supportedLanguages: string[] = [];
   private voiceOutputs: Map<string, VoiceOutput> = new Map();
+  private lineReportStore: LineReportStore;
 
   // Get supported languages from adapter registry
   private getSupportedLanguages(): string[] {
@@ -220,17 +222,6 @@ export class DebugMcpServer {
     return this.sessionManager.setBreakpoint(sessionId, file, line, condition);
   }
 
-  public async setBreakpoints(sessionId: string, file: string): Promise<{ success: boolean; breakpoints: Breakpoint[]; errors: string[] }> {
-    this.validateSession(sessionId);
-    
-    // In container mode, prepend /workspace/ to the path
-    if (process.env.MCP_CONTAINER === 'true') {
-      file = `/workspace/${file}`;
-    }
-    
-    this.logger.info(`[DebugMcpServer.setBreakpoints] Using file path: ${file}`);
-    return this.sessionManager.setBreakpoints(sessionId, file);
-  }
 
   public async getVariables(sessionId: string, variablesReference: number): Promise<Variable[]> {
     this.validateSession(sessionId);
@@ -288,6 +279,58 @@ export class DebugMcpServer {
     return true;
   }
 
+  public async submitLineReport(report: LineReport): Promise<number> {
+    try {
+      const reportId = await this.lineReportStore.addLineReport(report);
+      this.logger.info(`[DebugMcpServer] Line report submitted for session ${report.sessionId}, line ${report.lineNumber}`);
+      return reportId;
+    } catch (error) {
+      this.logger.error('[DebugMcpServer] Failed to submit line report:', error);
+      throw new McpError(McpErrorCode.InternalError, `Failed to submit line report: ${error}`);
+    }
+  }
+
+  public async initializeLineReportStore(): Promise<void> {
+    try {
+      await this.lineReportStore.initialize();
+      this.logger.info('[DebugMcpServer] Line report store initialized');
+    } catch (error) {
+      this.logger.error('[DebugMcpServer] Failed to initialize line report store:', error);
+      throw new McpError(McpErrorCode.InternalError, `Failed to initialize line report store: ${error}`);
+    }
+  }
+
+  public async createReportSession(sessionId: string, summary: SessionSummary): Promise<void> {
+    try {
+      await this.lineReportStore.createSession(summary);
+      this.logger.info(`[DebugMcpServer] Debug session created in report store: ${sessionId}`);
+    } catch (error) {
+      this.logger.error('[DebugMcpServer] Failed to create debug session in report store:', error);
+      throw new McpError(McpErrorCode.InternalError, `Failed to create debug session: ${error}`);
+    }
+  }
+
+  public async endReportSession(sessionId: string): Promise<void> {
+    try {
+      await this.lineReportStore.endSession(sessionId);
+      this.logger.info(`[DebugMcpServer] Debug session ended in report store: ${sessionId}`);
+    } catch (error) {
+      this.logger.error('[DebugMcpServer] Failed to end debug session in report store:', error);
+      throw new McpError(McpErrorCode.InternalError, `Failed to end debug session: ${error}`);
+    }
+  }
+
+  public async exportSessionReport(sessionId: string): Promise<string> {
+    try {
+      const jsonReport = await this.lineReportStore.exportSessionAsJson(sessionId);
+      this.logger.info(`[DebugMcpServer] Session report exported for: ${sessionId}`);
+      return jsonReport;
+    } catch (error) {
+      this.logger.error('[DebugMcpServer] Failed to export session report:', error);
+      throw new McpError(McpErrorCode.InternalError, `Failed to export session report: ${error}`);
+    }
+  }
+
   constructor(options: DebugMcpServerOptions = {}) {
     this.constructorOptions = options;
     
@@ -312,6 +355,7 @@ export class DebugMcpServer {
     };
     
     this.sessionManager = new SessionManager(sessionManagerConfig, dependencies);
+    this.lineReportStore = new LineReportStore(this.logger);
 
     this.registerTools();
     this.server.onerror = (error) => {
@@ -380,7 +424,8 @@ export class DebugMcpServer {
           { name: 'list_supported_languages', description: 'List all supported debugging languages with metadata', inputSchema: { type: 'object', properties: {} } },
           { name: 'list_debug_sessions', description: 'List all active debugging sessions', inputSchema: { type: 'object', properties: {} } },
           { name: 'set_breakpoint', description: 'Set a breakpoint. Setting breakpoints on non-executable lines (structural, declarative) may lead to unexpected behavior', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, file: { type: 'string', description: fileDescription }, line: { type: 'number', description: 'Line number where to set breakpoint. Executable statements (assignments, function calls, conditionals, returns) work best. Structural lines (function/class definitions), declarative lines (imports), or non-executable lines (comments, blank lines) may cause unexpected stepping behavior' }, condition: { type: 'string' } }, required: ['sessionId', 'file', 'line'] } },
-          { name: 'set_breakpoints', description: 'Set breakpoints on all executable lines in a file', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, file: { type: 'string', description: fileDescription } }, required: ['sessionId', 'file'] } },
+          { name: 'submit_line_report', description: 'Submit a line execution report for debugging analysis', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, file: { type: 'string' }, lineNumber: { type: 'number' }, code: { type: 'string' }, timestamp: { type: 'string' }, variables: { type: 'object' }, stackDepth: { type: 'number' }, threadId: { type: 'number' }, observations: { type: 'string' }, status: { type: 'string', enum: ['success', 'error', 'warning'] }, errorMessage: { type: 'string' }, errorType: { type: 'string' }, stackTrace: { type: 'string' } }, required: ['sessionId', 'file', 'lineNumber', 'code', 'timestamp', 'status', 'stackDepth', 'threadId'] } },
+          { name: 'export_session_report', description: 'Export debug session report as JSON', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' } }, required: ['sessionId'] } },
           { name: 'start_debugging', description: 'Start debugging a script', inputSchema: { 
               type: 'object', 
               properties: { 
@@ -495,37 +540,67 @@ export class DebugMcpServer {
               }
               break;
             }
-            case 'set_breakpoints': {
-              if (!args.sessionId || !args.file) {
+            case 'submit_line_report': {
+              if (!args.sessionId || !args.file || args.lineNumber === undefined || !args.code || !args.timestamp || !args.status || args.stackDepth === undefined || args.threadId === undefined) {
                 throw new McpError(McpErrorCode.InvalidParams, 'Missing required parameters');
               }
               
               try {
-                const breakpointsResult = await this.setBreakpoints(args.sessionId, args.file);
-                
-                // Log breakpoints event
-                this.logger.info('debug:breakpoints', {
-                  event: 'bulk_set',
+                const report: LineReport = {
                   sessionId: args.sessionId,
-                  sessionName: this.getSessionName(args.sessionId),
                   file: args.file,
-                  breakpointCount: breakpointsResult.breakpoints.length,
-                  errorCount: breakpointsResult.errors.length,
+                  lineNumber: args.lineNumber,
+                  code: args.code,
+                  timestamp: args.timestamp,
+                  variables: args.variables || {},
+                  stackDepth: args.stackDepth,
+                  threadId: args.threadId,
+                  observations: args.observations,
+                  status: args.status,
+                  errorMessage: args.errorMessage,
+                  errorType: args.errorType,
+                  stackTrace: args.stackTrace
+                };
+                
+                const reportId = await this.submitLineReport(report);
+                
+                this.logger.info('debug:line_report', {
+                  event: 'submitted',
+                  sessionId: args.sessionId,
+                  lineNumber: args.lineNumber,
+                  status: args.status,
+                  reportId,
                   timestamp: Date.now()
                 });
                 
                 result = { content: [{ type: 'text', text: JSON.stringify({ 
-                  success: breakpointsResult.success, 
-                  breakpointCount: breakpointsResult.breakpoints.length,
-                  breakpoints: breakpointsResult.breakpoints.map(bp => ({ 
-                    id: bp.id, 
-                    file: bp.file, 
-                    line: bp.line, 
-                    verified: bp.verified 
-                  })),
-                  errors: breakpointsResult.errors,
-                  message: `Set ${breakpointsResult.breakpoints.length} breakpoints${breakpointsResult.errors.length > 0 ? ` with ${breakpointsResult.errors.length} errors` : ''}`
+                  success: true,
+                  reportId,
+                  message: `Line report submitted for line ${args.lineNumber}`
                 }) }] };
+              } catch (error) {
+                // Handle validation errors specifically
+                if (error instanceof McpError && 
+                    (error.message.includes('terminated') || 
+                     error.message.includes('closed') || 
+                     error.message.includes('not found'))) {
+                  result = { content: [{ type: 'text', text: JSON.stringify({ success: false, error: error.message }) }] };
+                } else {
+                  // Re-throw unexpected errors
+                  throw error;
+                }
+              }
+              break;
+            }
+            case 'export_session_report': {
+              if (!args.sessionId) {
+                throw new McpError(McpErrorCode.InvalidParams, 'Missing required parameter: sessionId');
+              }
+              
+              try {
+                const jsonReport = await this.exportSessionReport(args.sessionId);
+                
+                result = { content: [{ type: 'text', text: jsonReport }] };
               } catch (error) {
                 // Handle validation errors specifically
                 if (error instanceof McpError && 
@@ -975,12 +1050,16 @@ export class DebugMcpServer {
    * Public methods for server lifecycle management
    */
   public async start(): Promise<void> {
+    // Initialize line report store
+    await this.initializeLineReportStore();
+    
     // For MCP servers, start is handled by transport
     this.logger.info('Debug MCP Server started');
   }
 
   public async stop(): Promise<void> {
     await this.sessionManager.closeAllSessions();
+    await this.lineReportStore.close();
     this.logger.info('Debug MCP Server stopped');
   }
 
